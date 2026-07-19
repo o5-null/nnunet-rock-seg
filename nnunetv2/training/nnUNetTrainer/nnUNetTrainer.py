@@ -227,17 +227,30 @@ class nnUNetTrainer(object):
             self._set_batch_size_and_oversample()
 
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
-                                                                   self.dataset_json)
+                                                                    self.dataset_json)
 
+            self.print_to_log_file("Building network architecture...")
             sig = inspect.signature(self.build_network_architecture)
             if 'plans_manager' in sig.parameters:
-                self.network = self.build_network_architecture(
-                    self.plans_manager,
-                    self.configuration_manager,
-                    self.num_input_channels,
-                    self.label_manager.num_segmentation_heads,
-                    self.enable_deep_supervision
-                ).to(self.device)
+                params = list(sig.parameters.keys())
+                if len(params) >= 2 and params[1] != 'configuration_manager':
+                    # Hybrid signature: (plans_manager, dataset_json, configuration_manager, ...)
+                    # Pass dataset_json in the second slot instead of configuration_manager
+                    self.network = self.build_network_architecture(
+                        self.plans_manager,
+                        self.dataset_json,
+                        self.configuration_manager,
+                        self.num_input_channels,
+                        self.enable_deep_supervision
+                    ).to(self.device)
+                else:
+                    self.network = self.build_network_architecture(
+                        self.plans_manager,
+                        self.configuration_manager,
+                        self.num_input_channels,
+                        self.label_manager.num_segmentation_heads,
+                        self.enable_deep_supervision
+                    ).to(self.device)
             else:
                 warnings.warn(
                     f"Trainer {self.__class__.__name__} uses the old build_network_architecture signature. "
@@ -534,11 +547,8 @@ class nnUNetTrainer(object):
         # todo rotation should be defined dynamically based on patch size (more isotropic patch sizes = more rotation)
         if dim == 2:
             do_dummy_2d_data_aug = False
-            # todo revisit this parametrization
-            if max(patch_size) / min(patch_size) > 1.5:
-                rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
-            else:
-                rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
+            # 固定 ±90° 旋转 + 镜像翻转（适用于岩石 CT/SEM 分割）
+            rotation_for_DA = (-90. / 360 * 2. * np.pi, 90. / 360 * 2. * np.pi)
             mirror_axes = (0, 1)
         elif dim == 3:
             # todo this is not ideal. We could also have patch_size (64, 16, 128) in which case a full 180deg 2d rot would be bad
@@ -615,42 +625,11 @@ class nnUNetTrainer(object):
         return optimizer, lr_scheduler
 
     def plot_network_architecture(self):
-        if self._do_i_compile():
-            self.print_to_log_file("Unable to plot network architecture: nnUNet_compile is enabled!")
-            return
-
+        # NOTE: torchview (v0.2.7) globally monkey-patches __torch_function__ on all tensors
+        # on import, which breaks train_step (0-d tensor iteration error). Disabled until
+        # a compatible version is available or the bug is fixed upstream.
         if self.local_rank == 0:
-            try:
-                # raise NotImplementedError('hiddenlayer no longer works and we do not have a viable alternative :-(')
-                # pip install git+https://github.com/saugatkandel/hiddenlayer.git
-
-                # from torchviz import make_dot
-                # # not viable.
-                # make_dot(tuple(self.network(torch.rand((1, self.num_input_channels,
-                #                                         *self.configuration_manager.patch_size),
-                #                                        device=self.device)))).render(
-                #     join(self.output_folder, "network_architecture.pdf"), format='pdf')
-                # self.optimizer.zero_grad()
-
-                # broken.
-
-                import hiddenlayer as hl
-                g = hl.build_graph(self.network,
-                                   torch.rand((1, self.num_input_channels,
-                                               *self.configuration_manager.patch_size),
-                                              device=self.device),
-                                   transforms=None)
-                g.save(join(self.output_folder, "network_architecture.pdf"))
-                del g
-            except Exception as e:
-                self.print_to_log_file("Unable to plot network architecture:")
-                self.print_to_log_file(e)
-
-                # self.print_to_log_file("\nprinting the network instead:\n")
-                # self.print_to_log_file(self.network)
-                # self.print_to_log_file("\n")
-            finally:
-                empty_cache(self.device)
+            self.print_to_log_file("Network architecture plot disabled (torchview compatibility issue).")
 
     def do_split(self):
         """
