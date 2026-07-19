@@ -118,3 +118,7 @@ ENV/
 
 CLAUDE.md
 AGENTS.md
+.aim/
+.codebase-memory/
+*_modified.py
+*_modified.md
