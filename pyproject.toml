@@ -51,7 +51,20 @@ dependencies = [
     "yacs",
     "batchgeneratorsv2>=0.3.2",
     "einops",
-    "blosc2>=3.3.2"
+    "blosc2>=3.3.2",
+    # ---- MedNeXt-Volcanic-Rocks 模型家族扩展依赖 ----
+    # U-Mamba & LightM-UNet: 需要 mamba-ssm (官方推荐源码编译以避免 CUDA 兼容问题)
+    "mamba-ssm",
+    # U-Mamba 内部 SSM 选择性扫描 / mamba1 包
+    "causal-conv1d",
+    # LightM-UNet & SegResNet: MONAI 网络组件
+    "monai>=1.4.0",
+    # SAMed LoRA 权重加载/保存 (segment_anything)
+    "safetensors",
+    # segment_anything 推理所需的图像变换 (ResizeLongestSide)
+    "torchvision",
+    # segment_anything.utils.amg 掩码处理 (延迟导入, 仅启用 SAMed 时需要)
+    "opencv-python",
 ]
 
 [project.urls]
