@@ -3,6 +3,10 @@ import os
 import socket
 from typing import Union, Optional
 
+# === Default environment optimizations for RTX 3080 (Ampere) ===
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
+os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
+
 import torch.cuda
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -139,6 +143,9 @@ def run_training(dataset_name_or_id: Union[str, int],
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
                  device: torch.device = torch.device('cuda')):
+    # Enable TF32 on Ampere+ GPUs for ~1.5x matmul speedup
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
               "INFO: You are using the old nnU-Net default plans. We have updated our recommendations. "

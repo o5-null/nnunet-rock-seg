@@ -9,6 +9,8 @@ from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List
 
+from tqdm import tqdm
+
 import numpy as np
 import torch
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
@@ -159,6 +161,7 @@ class nnUNetTrainer(object):
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
+        self.autocast_dtype = torch.float16  # 默认 fp16 AMP，子类可改为 bf16
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -210,6 +213,15 @@ class nnUNetTrainer(object):
         if not self.was_initialized:
             ## DDP batch size and oversampling can differ between workers and needs adaptation
             # we need to change the batch size in DDP because we don't use any of those distributed samplers
+            self.print_to_log_file("Initializing trainer...")
+            # Enable TF32 + cuDNN autotune on CUDA for ~15-25% speedup
+            if self.device.type == 'cuda':
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision('high')
+                self.print_to_log_file("Enabled TF32 matmul, TF32 cuDNN, cuDNN benchmark, "
+                                       "and float32 matmul precision 'high'")
             self._set_batch_size_and_oversample()
 
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
@@ -259,7 +271,9 @@ class nnUNetTrainer(object):
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
+            self._warmup_kernels()
             self.was_initialized = True
+            self.print_to_log_file("Initialization complete.")
 
             logger_config_hparas = {
                 "initial_lr": self.initial_lr,
@@ -276,6 +290,34 @@ class nnUNetTrainer(object):
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
+
+    def _warmup_kernels(self):
+        """Warm up custom CUDA/Triton kernels to avoid JIT compilation stalls on the first batch.
+
+        Default: 2 dummy forward passes. The first triggers Triton / custom kernel JIT,
+        the second verifies cache hit. Standard cuDNN ops complete instantly.
+        Subclasses can override to add architecture-specific warmup logic.
+        """
+        if self.device.type != 'cuda':
+            return
+
+        # DDP: all ranks must forward to pass sync barriers, but only rank 0 logs
+        show_log = not (self.is_ddp and self.local_rank != 0)
+
+        if show_log:
+            self.print_to_log_file("Warming up kernels (Triton JIT compilation) ...")
+
+        dummy = torch.randn(
+            (1, self.num_input_channels, *self.configuration_manager.patch_size),
+            device=self.device,
+        )
+        with torch.no_grad():
+            for _ in tqdm(range(2), desc="Kernel warmup", disable=not show_log,
+                          leave=False, unit="fw"):
+                _ = self.network(dummy)
+
+        if show_log:
+            self.print_to_log_file("Kernel warmup complete.")
 
     def _do_i_compile(self):
         # new default: compile is enabled!
@@ -1031,7 +1073,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, dtype=self.autocast_dtype, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             # del data
             l = self.loss(output, target)
@@ -1077,7 +1119,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, dtype=self.autocast_dtype, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             del data
             l = self.loss(output, target)
