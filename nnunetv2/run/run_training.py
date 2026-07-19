@@ -105,11 +105,16 @@ def cleanup_ddp():
 
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size):
+            pretrained_weights, npz, val_with_best, world_size, num_epochs=None):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
     nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p, c)
+
+    # 命令行 -epoch 覆盖 trainer 默认值（优先级高于 trainer 类自带设置）
+    # 必须在 run_training() 调用前设置，确保 LR scheduler 与训练循环都使用新值
+    if num_epochs is not None:
+        nnunet_trainer.num_epochs = num_epochs
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -142,7 +147,8 @@ def run_training(dataset_name_or_id: Union[str, int],
                  only_run_validation: bool = False,
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
-                 device: torch.device = torch.device('cuda')):
+                 num_epochs: Optional[int] = None,
+                  device: torch.device = torch.device('cuda')):
     # Enable TF32 on Ampere+ GPUs for ~1.5x matmul speedup
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -185,12 +191,19 @@ def run_training(dataset_name_or_id: Union[str, int],
                      pretrained_weights,
                      export_validation_probabilities,
                      val_with_best,
-                     num_gpus),
+                     num_gpus,
+                     num_epochs),
                  nprocs=num_gpus,
                  join=True)
     else:
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
                                                plans_identifier, continue_training, device=device)
+
+        # 命令行 -epoch 覆盖 trainer 默认值（优先级高于 trainer 类自带设置）
+        # 必须在 run_training() 调用前设置，确保 LR scheduler(PolyLRScheduler 使用 self.num_epochs)
+        # 与训练主循环 for epoch in range(..., self.num_epochs) 都使用新值
+        if num_epochs is not None:
+            nnunet_trainer.num_epochs = num_epochs
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -248,6 +261,10 @@ def run_training_entry():
                     help="Use this to set the device the training should run with. Available options are 'cuda' "
                          "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
                          "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!")
+    parser.add_argument('-epoch', type=int, default=None, required=False,
+                        help='[OPTIONAL] 覆盖 trainer 的训练 epoch 数。不传则使用 trainer 类自带默认值 '
+                             '(nnUNetTrainer 默认 1000，变体如 nnUNetTrainer_100epochs 带 100)。'
+                             '显式传入会覆盖变体类设置，例如 -tr nnUNetTrainer_100epochs -epoch 50 实际跑 50 epoch。')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -265,7 +282,7 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device)
+                 num_epochs=args.epoch, device=device)
 
 
 if __name__ == '__main__':
