@@ -210,6 +210,39 @@ class ConfigurationManager(object):
     def previous_stage_name(self) -> Union[str, None]:
         return self.configuration.get('previous_stage')
 
+    # -----------------------------------------------------------------------
+    # 以下属性为 mednext fork 的自定义网络（UMambaBot/UMambaEnc 等）提供兼容性。
+    # 新版 plans 将网络架构参数移至 architecture.arch_kwargs 下：
+    #   - conv_kernel_sizes   → arch_kwargs['kernel_sizes']
+    #   - n_conv_per_stage_encoder → arch_kwargs['n_conv_per_stage']（或 n_blocks_per_stage）
+    #   - n_conv_per_stage_decoder → arch_kwargs['n_conv_per_stage_decoder']
+    #   - UNet_base_num_features   → arch_kwargs['features_per_stage'][0]
+    #   - unet_max_num_features    → max(arch_kwargs['features_per_stage'])
+    # 同时兼容旧格式（backward compat 在 __init__ 中已处理）。
+    # -----------------------------------------------------------------------
+    @property
+    def conv_kernel_sizes(self):
+        return self.configuration['architecture']['arch_kwargs']['kernel_sizes']
+
+    @property
+    def n_conv_per_stage_encoder(self):
+        kw = self.configuration['architecture']['arch_kwargs']
+        if 'n_conv_per_stage' in kw:
+            return kw['n_conv_per_stage']
+        return kw['n_blocks_per_stage']
+
+    @property
+    def n_conv_per_stage_decoder(self):
+        return self.configuration['architecture']['arch_kwargs']['n_conv_per_stage_decoder']
+
+    @property
+    def UNet_base_num_features(self):
+        return self.configuration['architecture']['arch_kwargs']['features_per_stage'][0]
+
+    @property
+    def unet_max_num_features(self):
+        return max(self.configuration['architecture']['arch_kwargs']['features_per_stage'])
+
 
 class PlansManager(object):
     def __init__(self, plans_file_or_dict: Union[str, dict]):
