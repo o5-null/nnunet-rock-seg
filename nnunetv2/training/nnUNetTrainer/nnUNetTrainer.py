@@ -6,6 +6,7 @@ import sys
 import warnings
 from copy import deepcopy
 from datetime import datetime
+from threading import Thread
 from time import time, sleep
 from typing import Tuple, Union, List
 
@@ -116,7 +117,8 @@ class nnUNetTrainer(object):
         # need. So let's save the init args
         self.my_init_kwargs = {}
         for k in inspect.signature(self.__init__).parameters.keys():
-            self.my_init_kwargs[k] = locals()[k]
+            if k in locals():
+                self.my_init_kwargs[k] = locals()[k]
 
         ###  Saving all the init args into class variables for later access
         continue_training = plans.pop("continue_training")
@@ -258,6 +260,10 @@ class nnUNetTrainer(object):
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
 
+            n_params = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
+            self.print_to_log_file(f"Network built. Trainable parameters: {n_params:,}")
+
+            self.print_to_log_file("Configuring optimizer and loss...")
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
@@ -266,11 +272,19 @@ class nnUNetTrainer(object):
 
             self.loss = self._build_loss()
 
+            self.print_to_log_file("Detecting dataset format...")
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+            self.print_to_log_file(f"Using dataset class: {self.dataset_class.__name__}")
 
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
+            # register additional metric keys in the logger for per-epoch tracking
+            extra_metrics = ['iou_per_class', 'precision_per_class', 'recall_per_class', 'specificity_per_class']
+            for key in extra_metrics:
+                if key not in self.logger.local_logger.my_fantastic_logging:
+                    self.logger.local_logger.my_fantastic_logging[key] = list()
+
             self._warmup_kernels()
             self.was_initialized = True
             self.print_to_log_file("Initialization complete.")
@@ -587,7 +601,10 @@ class nnUNetTrainer(object):
             dct = deepcopy(self.plans_manager.plans)
             del dct['configurations']
             self.print_to_log_file(f"\nThis is the configuration used by this "
-                                   f"training:\nConfiguration name: {self.configuration_name}\n",
+                                   f"training:\n"
+                                   f"Trainer: {self.__class__.__name__}\n"
+                                   f"NumEpochs: {self.num_epochs}\n"
+                                   f"Configuration name: {self.configuration_name}\n",
                                    self.configuration_manager, '\n', add_timestamp=False)
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
@@ -727,6 +744,7 @@ class nnUNetTrainer(object):
         ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
 
         # training pipeline
+        self.print_to_log_file("Setting up data augmentation pipeline...")
         tr_transforms = self.get_training_transforms(
             patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
             use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
@@ -742,6 +760,7 @@ class nnUNetTrainer(object):
                                                         self.label_manager.has_regions else None,
                                                         ignore_label=self.label_manager.ignore_label)
 
+        self.print_to_log_file("Creating training and validation datasets...")
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
         dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
                                  initial_patch_size,
@@ -758,6 +777,7 @@ class nnUNetTrainer(object):
                                   sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
+        self.print_to_log_file(f"Starting data loading workers ({get_allowed_n_proc_DA()} processes)...")
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
@@ -765,16 +785,23 @@ class nnUNetTrainer(object):
         else:
             mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
                                                         num_processes=allowed_num_processes,
-                                                        num_cached=max(6, allowed_num_processes // 2), seeds=None,
+                                                        num_cached=allowed_num_processes, seeds=None,
                                                         pin_memory=self.device.type == 'cuda', wait_time=0.002)
             mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
                                                       transform=None, num_processes=max(1, allowed_num_processes // 2),
-                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                                                      num_cached=max(3, allowed_num_processes // 2), seeds=None,
                                                       pin_memory=self.device.type == 'cuda',
                                                       wait_time=0.002)
-        # # let's get this party started
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
+        # Train augmenter must be ready before training starts → start synchronously.
+        # Val augmenter is only needed at epoch end → start in background thread to
+        # overlap its process spawning with the first training epoch. This saves
+        # ~1 min of startup time (12 fewer processes on the critical path).
+        if isinstance(mt_gen_train, NonDetMultiThreadedAugmenter):
+            mt_gen_train._start()
+        if isinstance(mt_gen_val, NonDetMultiThreadedAugmenter):
+            self._val_start_thread = Thread(target=mt_gen_val._start)
+            self._val_start_thread.start()
+        self.print_to_log_file("Data pipeline initialized (train ready, val workers starting in background).")
         return mt_gen_train, mt_gen_val
 
     @staticmethod
@@ -985,6 +1012,7 @@ class nnUNetTrainer(object):
 
         # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
         # which may not be present  when doing inference
+        self.print_to_log_file("Preparing data loaders...")
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
         maybe_mkdir_p(self.output_folder)
@@ -997,6 +1025,7 @@ class nnUNetTrainer(object):
 
         # maybe unpack
         if self.local_rank == 0:
+            self.print_to_log_file("Unpacking dataset (converting .npz to .npy)...")
             self.dataset_class.unpack_dataset(
                 self.preprocessed_dataset_folder,
                 overwrite_existing=False,
@@ -1156,11 +1185,12 @@ class nnUNetTrainer(object):
         else:
             mask = None
 
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+        tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
 
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
+        tn_hard = tn.detach().cpu().numpy()
         if not self.label_manager.has_regions:
             # if we train with regions all segmentation heads predict some kind of foreground. In conventional
             # (softmax training) there needs tobe one output for the background. We are not interested in the
@@ -1169,14 +1199,17 @@ class nnUNetTrainer(object):
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
+            tn_hard = tn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard,
+                'fn_hard': fn_hard, 'tn_hard': tn_hard}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
         tp = np.sum(outputs_collated['tp_hard'], 0)
         fp = np.sum(outputs_collated['fp_hard'], 0)
         fn = np.sum(outputs_collated['fn_hard'], 0)
+        tn = np.sum(outputs_collated['tn_hard'], 0)
 
         if self.is_ddp:
             world_size = dist.get_world_size()
@@ -1193,6 +1226,10 @@ class nnUNetTrainer(object):
             dist.all_gather_object(fns, fn)
             fn = np.vstack([i[None] for i in fns]).sum(0)
 
+            tns = [None for _ in range(world_size)]
+            dist.all_gather_object(tns, tn)
+            tn = np.vstack([i[None] for i in tns]).sum(0)
+
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
@@ -1205,18 +1242,88 @@ class nnUNetTrainer(object):
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
 
+        # compute additional confusion-matrix metrics
+        with np.errstate(invalid='ignore', divide='ignore'):
+            iou_pc = np.array([i / (i + j + k) for i, j, k in zip(tp, fp, fn)])
+            prec_pc = np.array([i / (i + j) for i, j in zip(tp, fp)])
+            rec_pc = np.array([i / (i + k) for i, k in zip(tp, fn)])
+            spec_pc = np.array([k / (k + j) for k, j in zip(tn, fp)])
+        self.logger.log('iou_per_class', list(iou_pc), self.current_epoch)
+        self.logger.log('precision_per_class', list(prec_pc), self.current_epoch)
+        self.logger.log('recall_per_class', list(rec_pc), self.current_epoch)
+        self.logger.log('specificity_per_class', list(spec_pc), self.current_epoch)
+
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.get_value('train_losses', step=-1), decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.get_value('val_losses', step=-1), decimals=4))
-        self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
-                                               self.logger.get_value('dice_per_class_or_region', step=-1)])
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.get_value('epoch_end_timestamps', step=-1) - self.logger.get_value('epoch_start_timestamps', step=-1), decimals=2)} s")
+        # helper: compute delta from previous epoch (None if first epoch)
+        def _delta(key):
+            try:
+                return self.logger.get_value(key, step=-1) - self.logger.get_value(key, step=-2)
+            except (IndexError, TypeError):
+                return None
+
+        # train loss
+        tr_loss = float(self.logger.get_value('train_losses', step=-1))
+        tr_delta = _delta('train_losses')
+        if tr_delta is not None:
+            self.print_to_log_file(f'train_loss    {tr_loss:.4f}   (Δ {tr_delta:+.4f})')
+        else:
+            self.print_to_log_file(f'train_loss    {tr_loss:.4f}')
+
+        # val loss
+        val_loss = float(self.logger.get_value('val_losses', step=-1))
+        val_delta = _delta('val_losses')
+        if val_delta is not None:
+            self.print_to_log_file(f'val_loss      {val_loss:.4f}   (Δ {val_delta:+.4f})')
+        else:
+            self.print_to_log_file(f'val_loss      {val_loss:.4f}')
+
+        # helper: format a per-class metric list with optional delta
+        def _fmt_per_class(key, label, width=13):
+            raw = self.logger.get_value(key, step=-1)
+            val_str = ', '.join(f'{v:.4f}' for v in raw)
+            delta = _delta(key)
+            if delta is not None:
+                delta_str = ', '.join(f'{d:+.4f}' for d in delta)
+                self.print_to_log_file(f'{label:<{width}} [{val_str}]   (Δ [{delta_str}])')
+            else:
+                self.print_to_log_file(f'{label:<{width}} [{val_str}]')
+
+        # per-class metrics
+        _fmt_per_class('dice_per_class_or_region', 'Pseudo dice')
+        _fmt_per_class('iou_per_class', 'IoU')
+        _fmt_per_class('precision_per_class', 'Precision')
+        _fmt_per_class('recall_per_class', 'Recall')
+        _fmt_per_class('specificity_per_class', 'Specificity')
+
+        # mean foreground dice
+        fg_dice = float(self.logger.get_value('mean_fg_dice', step=-1))
+        fg_delta = _delta('mean_fg_dice')
+        if fg_delta is not None:
+            self.print_to_log_file(f'mean_fg_dice  {fg_dice:.4f}   (Δ {fg_delta:+.4f})')
+        else:
+            self.print_to_log_file(f'mean_fg_dice  {fg_dice:.4f}')
+
+        # ema foreground dice
+        ema = float(self.logger.get_value('ema_fg_dice', step=-1))
+        ema_delta = _delta('ema_fg_dice')
+        if ema_delta is not None:
+            self.print_to_log_file(f'ema_fg_dice   {ema:.4f}   (Δ {ema_delta:+.4f})')
+        else:
+            self.print_to_log_file(f'ema_fg_dice   {ema:.4f}')
+
+        # learning rate
+        lr = float(self.logger.get_value('lrs', step=-1))
+        self.print_to_log_file(f'lr            {lr:.6f}')
+
+        # epoch time
+        epoch_time = self.logger.get_value('epoch_end_timestamps', step=-1) - \
+                     self.logger.get_value('epoch_start_timestamps', step=-1)
+        self.print_to_log_file(f'Epoch time    {epoch_time:.2f} s')
 
         # handling periodic checkpointing
         current_epoch = self.current_epoch
@@ -1298,6 +1405,9 @@ class nnUNetTrainer(object):
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
 
     def perform_actual_validation(self, save_probabilities: bool = False):
+        if self.disable_checkpointing:
+            self.print_to_log_file('Validation skipped, checkpointing is disabled')
+            return
         self.set_deep_supervision_enabled(False)
         self.network.eval()
 
@@ -1464,15 +1574,27 @@ class nnUNetTrainer(object):
 
             self.on_train_epoch_start()
             train_outputs = []
-            for batch_id in range(self.num_iterations_per_epoch):
-                train_outputs.append(self.train_step(next(self.dataloader_train)))
+            total_imgs = self.num_iterations_per_epoch * self.batch_size
+            with tqdm(total=total_imgs, desc=f"Epoch {epoch} Train",
+                      unit="img", leave=False, disable=self.local_rank != 0) as pbar:
+                for batch_id in range(self.num_iterations_per_epoch):
+                    output = self.train_step(next(self.dataloader_train))
+                    train_outputs.append(output)
+                    pbar.update(self.batch_size)
+                    pbar.set_postfix(loss=float(output['loss']))
             self.on_train_epoch_end(train_outputs)
 
             with torch.no_grad():
                 self.on_validation_epoch_start()
                 val_outputs = []
-                for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                total_val_imgs = self.num_val_iterations_per_epoch * self.batch_size
+                with tqdm(total=total_val_imgs, desc=f"Epoch {epoch} Val",
+                          unit="img", leave=False, disable=self.local_rank != 0) as pbar:
+                    for batch_id in range(self.num_val_iterations_per_epoch):
+                        output = self.validation_step(next(self.dataloader_val))
+                        val_outputs.append(output)
+                        pbar.update(self.batch_size)
+                        pbar.set_postfix(loss=float(output['loss']))
                 self.on_validation_epoch_end(val_outputs)
 
             self.on_epoch_end()

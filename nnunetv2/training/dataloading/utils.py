@@ -52,19 +52,30 @@ def _convert_to_npy(npz_file: str, unpack_segmentation: bool = True, overwrite_e
         raise KeyboardInterrupt
 
 
+def _unpack_worker(args):
+    """Wrapper for imap_unordered: unpacks a single .npz file."""
+    return _convert_to_npy(*args)
+
+
 def unpack_dataset(folder: str, unpack_segmentation: bool = True, overwrite_existing: bool = False,
                    num_processes: int = default_num_processes,
                    verify: bool = False):
     """
     all npz files in this folder belong to the dataset, unpack them all
     """
+    from tqdm import tqdm
+    npz_files = subfiles(folder, True, None, ".npz", True)
+
     with multiprocessing.get_context("spawn").Pool(num_processes) as p:
-        npz_files = subfiles(folder, True, None, ".npz", True)
-        p.starmap(_convert_to_npy, zip(npz_files,
-                                       [unpack_segmentation] * len(npz_files),
-                                       [overwrite_existing] * len(npz_files),
-                                       [verify] * len(npz_files))
-                  )
+        args_list = list(zip(npz_files,
+                             [unpack_segmentation] * len(npz_files),
+                             [overwrite_existing] * len(npz_files),
+                             [verify] * len(npz_files)))
+        # show progress bar for non-trivial unpacking
+        for _ in tqdm(p.imap_unordered(_unpack_worker, args_list),
+                      total=len(args_list), desc="Unpacking", unit="files",
+                      disable=len(args_list) < 5):
+            pass
 
 
 if __name__ == '__main__':
