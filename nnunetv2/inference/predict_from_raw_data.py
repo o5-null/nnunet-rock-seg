@@ -21,6 +21,9 @@ from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from nnunetv2.configuration import default_num_processes
+
+# 预测线程数默认值，继承环境变量 nnUNet_n_proc_DA，默认 1（单线程）
+default_num_processes_prediction = int(os.environ.get('nnUNet_n_proc_DA', '1'))
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
     preprocessing_iterator_fromnpy
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, \
@@ -226,10 +229,13 @@ class nnUNetPredictor(object):
                            num_processes_segmentation_export: int = default_num_processes,
                            folder_with_segs_from_prev_stage: str = None,
                            num_parts: int = 1,
-                           part_id: int = 0):
+                           part_id: int = 0,
+                           num_processes_prediction: int = default_num_processes_prediction):
         """
         This is nnU-Net's default function for making predictions. It works best for batch predictions
         (predicting many images at once).
+
+        num_processes_prediction: 并行预测线程数。>1 时使用多线程并行 GPU 推理。
         """
         assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
                                       "So if there are 3 parts then valid part IDs are 0, 1, 2")
@@ -278,7 +284,8 @@ class nnUNetPredictor(object):
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
 
-        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export,
+                                                num_processes_prediction)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
                                                             input_list_of_lists: List[List[str]],
@@ -352,54 +359,39 @@ class nnUNetPredictor(object):
                                         truncated_ofname: Union[str, List[str], None],
                                         num_processes: int = 3,
                                         save_probabilities: bool = False,
-                                        num_processes_segmentation_export: int = default_num_processes):
+                                        num_processes_segmentation_export: int = default_num_processes,
+                                        num_processes_prediction: int = default_num_processes_prediction):
         iterator = self.get_data_iterator_from_raw_npy_data(image_or_list_of_images,
                                                             segs_from_prev_stage_or_list_of_segs_from_prev_stage,
                                                             properties_or_list_of_properties,
                                                             truncated_ofname,
                                                             num_processes)
-        return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
+        return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export,
+                                                num_processes_prediction)
 
     def predict_from_data_iterator(self,
                                    data_iterator,
                                    save_probabilities: bool = False,
-                                   num_processes_segmentation_export: int = default_num_processes):
+                                   num_processes_segmentation_export: int = default_num_processes,
+                                   num_processes_prediction: int = default_num_processes_prediction):
         """
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
+
+        num_processes_prediction: 并行预测线程数。>1 时使用多线程并行进行 GPU 推理，
+                                  可加速多图像预测（数据加载并行 + GPU 推理串行化）。
+                                 默认 1（单线程，与原行为兼容）。
         """
+        print(f'perform_everything_on_device: {self.perform_everything_on_device}')
+
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
-            for preprocessed in data_iterator:
-                data = preprocessed['data']
-                if isinstance(data, str):
-                    delfile = data
-                    data = torch.from_numpy(np.load(data))
-                    os.remove(delfile)
 
-                ofile = preprocessed['ofile']
+            # ---- export 提交辅助函数 ----
+            def _submit_export(prediction, ofile, properties):
+                """将预测结果提交到 export 后台进程池"""
                 if ofile is not None:
-                    print(f'\nPredicting {os.path.basename(ofile)}:')
-                else:
-                    print(f'\nPredicting image of shape {data.shape}:')
-
-                print(f'perform_everything_on_device: {self.perform_everything_on_device}')
-
-                properties = preprocessed['data_properties']
-
-                # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
-                # npy files
-                proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
-                while not proceed:
-                    sleep(0.1)
-                    proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
-
-                # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
-
-                if ofile is not None:
-                    print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.apply_async(
                             export_prediction_from_logits,
@@ -408,7 +400,6 @@ class nnUNetPredictor(object):
                         )
                     )
                 else:
-                    print('sending off prediction to background worker for resampling')
                     r.append(
                         export_pool.apply_async(
                             convert_predicted_logits_to_segmentation_with_correct_shape,
@@ -418,10 +409,77 @@ class nnUNetPredictor(object):
                              save_probabilities)
                         )
                     )
-                if ofile is not None:
-                    print(f'done with {os.path.basename(ofile)}')
-                else:
-                    print(f'\nDone with image of shape {data.shape}:')
+
+            # ---- 反压检查辅助函数 ----
+            def _wait_for_export_backpressure():
+                """避免 export 队列堆积过多导致内存爆炸"""
+                proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+                while not proceed:
+                    sleep(0.1)
+                    proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+
+            if num_processes_prediction <= 1:
+                # ======== 单线程路径（惰性迭代，内存友好）========
+                with tqdm(desc="Predicting", unit="img", disable=not self.allow_tqdm) as pbar:
+                    for preprocessed in data_iterator:
+                        data = preprocessed['data']
+                        if isinstance(data, str):
+                            delfile = data
+                            data = torch.from_numpy(np.load(data))
+                            os.remove(delfile)
+
+                        ofile = preprocessed['ofile']
+                        properties = preprocessed['data_properties']
+
+                        _wait_for_export_backpressure()
+
+                        # GPU 推理（numpy 转换避免 multiprocessing 序列化对齐错误）
+                        prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+
+                        _submit_export(prediction, ofile, properties)
+                        pbar.update()
+            else:
+                # ======== 多线程并行路径 ========
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import threading
+
+                # 先收集所有预处理的条目（多线程分发需要全部数据）
+                items = list(data_iterator)
+                _predict_lock = threading.Lock()
+
+                def _predict_worker(preprocessed):
+                    """工作线程：加载数据 -> GPU 推理 -> 返回结果"""
+                    data = preprocessed['data']
+                    if isinstance(data, str):
+                        delfile = data
+                        data = torch.from_numpy(np.load(data))
+                        os.remove(delfile)
+
+                    # load_state_dict 非线程安全，用锁串行化 GPU 推理
+                    with _predict_lock:
+                        prediction = self.predict_logits_from_preprocessed_data(data)
+                    return prediction.cpu().detach().numpy(), preprocessed['ofile'], preprocessed['data_properties']
+
+                with ThreadPoolExecutor(max_workers=num_processes_prediction) as executor:
+                    # 提交所有预测任务
+                    future_to_preprocessed = {
+                        executor.submit(_predict_worker, p): p
+                        for p in items
+                    }
+
+                    # 收集结果并提交 export
+                    with tqdm(total=len(items), desc="Predicting", disable=not self.allow_tqdm) as pbar:
+                        for future in as_completed(future_to_preprocessed):
+                            try:
+                                prediction, ofile, properties = future.result()
+                            except Exception as e:
+                                pbar.write(f"[ERROR] Prediction failed: {e}")
+                                pbar.update()
+                                continue
+
+                            _wait_for_export_backpressure()
+                            _submit_export(prediction, ofile, properties)
+                            pbar.update()
 
             print("GPU prediction completed. Waiting for remaining segmentation exports to finish...")
             ret = [None] * len(r)
@@ -858,8 +916,11 @@ def predict_entry_point_modelfolder():
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
     parser.add_argument('--not_on_device', action='store_true', required=False, default=False,
-                        help="Set this flag to disable perform_everything_on_device. Recommended for large cases that "
-                             "occupy more VRAM than available")
+                         help="Set this flag to disable perform_everything_on_device. Recommended for large cases that "
+                              "occupy more VRAM than available")
+    parser.add_argument('-nppred', type=int, required=False, default=default_num_processes_prediction,
+                         help='Number of threads for parallel prediction. >1 enables multi-threaded GPU inference. '
+                              'Default: nnUNet_n_proc_DA env or 1')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -903,7 +964,8 @@ def predict_entry_point_modelfolder():
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
-                                 num_parts=1, part_id=0)
+                                 num_parts=1, part_id=0,
+                                 num_processes_prediction=args.nppred)
 
 
 def predict_entry_point():
@@ -970,8 +1032,11 @@ def predict_entry_point():
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
     parser.add_argument('--not_on_device', action='store_true', required=False, default=False,
-                        help="Set this flag to disable perform_everything_on_device. Recommended for large cases that "
-                             "occupy more VRAM than available")
+                         help="Set this flag to disable perform_everything_on_device. Recommended for large cases that "
+                              "occupy more VRAM than available")
+    parser.add_argument('-nppred', type=int, required=False, default=default_num_processes_prediction,
+                         help='Number of threads for parallel prediction. >1 enables multi-threaded GPU inference. '
+                              'Default: nnUNet_n_proc_DA env or 1')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1037,7 +1102,8 @@ def predict_entry_point():
                                     num_processes_segmentation_export=args.nps,
                                     folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                     num_parts=args.num_parts,
-                                    part_id=args.part_id)
+                                    part_id=args.part_id,
+                                    num_processes_prediction=args.nppred)
 
     # r = predict_from_raw_data(args.i,
     #                           args.o,
