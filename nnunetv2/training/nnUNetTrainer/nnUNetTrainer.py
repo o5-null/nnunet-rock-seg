@@ -1245,53 +1245,67 @@ class nnUNetTrainer(object):
             except (IndexError, TypeError):
                 return None
 
-        # train loss
+        # arrow: ↑ = improvement, ↓ = degradation, → = no change
+        def _arrow(delta, higher_is_better=True):
+            if delta is None:
+                return ''
+            if isinstance(delta, (list, tuple, type(None))):
+                return ''
+            if abs(delta) < 1e-8:
+                return '→'
+            if higher_is_better:
+                return '↑' if delta > 0 else '↓'
+            else:
+                return '↓' if delta > 0 else '↑'
+
+        # train loss (lower is better)
         tr_loss = float(self.logger.get_value('train_losses', step=-1))
         tr_delta = _delta('train_losses')
         if tr_delta is not None:
-            self.print_to_log_file(f'train_loss    {tr_loss:.4f}   (Δ {tr_delta:+.4f})')
+            self.print_to_log_file(f'train_loss    {tr_loss:.4f}   (Δ {tr_delta:+.4f}) {_arrow(tr_delta, False)}')
         else:
             self.print_to_log_file(f'train_loss    {tr_loss:.4f}')
 
-        # val loss
+        # val loss (lower is better)
         val_loss = float(self.logger.get_value('val_losses', step=-1))
         val_delta = _delta('val_losses')
         if val_delta is not None:
-            self.print_to_log_file(f'val_loss      {val_loss:.4f}   (Δ {val_delta:+.4f})')
+            self.print_to_log_file(f'val_loss      {val_loss:.4f}   (Δ {val_delta:+.4f}) {_arrow(val_delta, False)}')
         else:
             self.print_to_log_file(f'val_loss      {val_loss:.4f}')
 
-        # helper: format a per-class metric list with optional delta
+        # helper: format a per-class metric list with optional delta + arrows
         def _fmt_per_class(key, label, width=13):
             raw = self.logger.get_value(key, step=-1)
             val_str = ', '.join(f'{v:.4f}' for v in raw)
             delta = _delta(key)
             if delta is not None:
                 delta_str = ', '.join(f'{d:+.4f}' for d in delta)
-                self.print_to_log_file(f'{label:<{width}} [{val_str}]   (Δ [{delta_str}])')
+                arrow_str = ', '.join(_arrow(d, True) for d in delta)
+                self.print_to_log_file(f'{label:<{width}} [{val_str}]   (Δ [{delta_str}]) [{arrow_str}]')
             else:
                 self.print_to_log_file(f'{label:<{width}} [{val_str}]')
 
-        # per-class metrics
+        # per-class metrics (higher is better)
         _fmt_per_class('dice_per_class_or_region', 'Pseudo dice')
         _fmt_per_class('iou_per_class', 'IoU')
         _fmt_per_class('precision_per_class', 'Precision')
         _fmt_per_class('recall_per_class', 'Recall')
         _fmt_per_class('specificity_per_class', 'Specificity')
 
-        # mean foreground dice
+        # mean foreground dice (higher is better)
         fg_dice = float(self.logger.get_value('mean_fg_dice', step=-1))
         fg_delta = _delta('mean_fg_dice')
         if fg_delta is not None:
-            self.print_to_log_file(f'mean_fg_dice  {fg_dice:.4f}   (Δ {fg_delta:+.4f})')
+            self.print_to_log_file(f'mean_fg_dice  {fg_dice:.4f}   (Δ {fg_delta:+.4f}) {_arrow(fg_delta, True)}')
         else:
             self.print_to_log_file(f'mean_fg_dice  {fg_dice:.4f}')
 
-        # ema foreground dice
+        # ema foreground dice (higher is better)
         ema = float(self.logger.get_value('ema_fg_dice', step=-1))
         ema_delta = _delta('ema_fg_dice')
         if ema_delta is not None:
-            self.print_to_log_file(f'ema_fg_dice   {ema:.4f}   (Δ {ema_delta:+.4f})')
+            self.print_to_log_file(f'ema_fg_dice   {ema:.4f}   (Δ {ema_delta:+.4f}) {_arrow(ema_delta, True)}')
         else:
             self.print_to_log_file(f'ema_fg_dice   {ema:.4f}')
 
@@ -1432,92 +1446,95 @@ class nnUNetTrainer(object):
 
             results = []
 
-            for i, k in enumerate(dataset_val.identifiers):
-                proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
-                                                           allowed_num_queued=2)
-                while not proceed:
-                    sleep(0.1)
+            disable_tqdm = self.local_rank != 0
+            with tqdm(dataset_val.identifiers, desc="Val", unit="img",
+                      disable=disable_tqdm) as pbar:
+                for i, k in enumerate(pbar):
                     proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
                                                                allowed_num_queued=2)
+                    while not proceed:
+                        sleep(0.1)
+                        proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+                                                                   allowed_num_queued=2)
 
-                self.print_to_log_file(f"predicting {k}")
-                data, _, seg_prev, properties = dataset_val.load_case(k)
+                    data, _, seg_prev, properties = dataset_val.load_case(k)
 
-                # we do [:] to convert blosc2 to numpy
-                data = data[:]
+                    # we do [:] to convert blosc2 to numpy
+                    data = data[:]
 
-                if self.is_cascaded:
-                    seg_prev = seg_prev[:]
-                    data = np.vstack((data, convert_labelmap_to_one_hot(seg_prev, self.label_manager.foreground_labels,
-                                                                        output_dtype=data.dtype)))
-                with warnings.catch_warnings():
-                    # ignore 'The given NumPy array is not writable' warning
-                    warnings.simplefilter("ignore")
-                    data = torch.from_numpy(data)
+                    if self.is_cascaded:
+                        seg_prev = seg_prev[:]
+                        data = np.vstack((data, convert_labelmap_to_one_hot(seg_prev, self.label_manager.foreground_labels,
+                                                                            output_dtype=data.dtype)))
+                    with warnings.catch_warnings():
+                        # ignore 'The given NumPy array is not writable' warning
+                        warnings.simplefilter("ignore")
+                        data = torch.from_numpy(data)
 
-                self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
-                output_filename_truncated = join(validation_output_folder, k)
+                    pbar.set_postfix_str(k)
 
-                prediction = predictor.predict_sliding_window_return_logits(data)
-                prediction = prediction.cpu()
+                    output_filename_truncated = join(validation_output_folder, k)
 
-                # this needs to go into background processes
-                results.append(
-                    segmentation_export_pool.starmap_async(
-                        export_prediction_from_logits, (
-                            (prediction, properties, self.configuration_manager, self.plans_manager,
-                             self.dataset_json, output_filename_truncated, save_probabilities),
+                    prediction = predictor.predict_sliding_window_return_logits(data)
+                    prediction = prediction.cpu()
+
+                    # this needs to go into background processes
+                    results.append(
+                        segmentation_export_pool.starmap_async(
+                            export_prediction_from_logits, (
+                                (prediction, properties, self.configuration_manager, self.plans_manager,
+                                 self.dataset_json, output_filename_truncated, save_probabilities),
+                            )
                         )
                     )
-                )
-                # for debug purposes
-                # export_prediction_from_logits(
-                #     prediction, properties, self.configuration_manager, self.plans_manager,
-                #      self.dataset_json, output_filename_truncated, save_probabilities
-                # )
+                    # for debug purposes
+                    # export_prediction_from_logits(
+                    #     prediction, properties, self.configuration_manager, self.plans_manager,
+                    #      self.dataset_json, output_filename_truncated, save_probabilities
+                    # )
 
-                # if needed, export the softmax prediction for the next stage
-                if next_stages is not None:
-                    for n in next_stages:
-                        next_stage_config_manager = self.plans_manager.get_configuration(n)
-                        expected_preprocessed_folder = join(nnUNet_preprocessed, self.plans_manager.dataset_name,
-                                                            next_stage_config_manager.data_identifier)
-                        # next stage may have a different dataset class, do not use self.dataset_class
-                        dataset_class = infer_dataset_class(expected_preprocessed_folder)
+                    # if needed, export the softmax prediction for the next stage
+                    if next_stages is not None:
+                        for n in next_stages:
+                            next_stage_config_manager = self.plans_manager.get_configuration(n)
+                            expected_preprocessed_folder = join(nnUNet_preprocessed, self.plans_manager.dataset_name,
+                                                                next_stage_config_manager.data_identifier)
+                            # next stage may have a different dataset class, do not use self.dataset_class
+                            dataset_class = infer_dataset_class(expected_preprocessed_folder)
 
-                        try:
-                            # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
-                            tmp = dataset_class(expected_preprocessed_folder, [k])
-                            d, _, _, _ = tmp.load_case(k)
-                        except FileNotFoundError:
-                            self.print_to_log_file(
-                                f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "
-                                f"Run the preprocessing for this configuration first!")
-                            continue
+                            try:
+                                # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
+                                tmp = dataset_class(expected_preprocessed_folder, [k])
+                                d, _, _, _ = tmp.load_case(k)
+                            except FileNotFoundError:
+                                self.print_to_log_file(
+                                    f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "
+                                    f"Run the preprocessing for this configuration first!")
+                                continue
 
-                        target_shape = d.shape[1:]
-                        output_folder = join(self.output_folder_base, 'predicted_next_stage', n)
-                        output_file_truncated = join(output_folder, k)
+                            target_shape = d.shape[1:]
+                            output_folder = join(self.output_folder_base, 'predicted_next_stage', n)
+                            output_file_truncated = join(output_folder, k)
 
-                        # resample_and_save(prediction, target_shape, output_file_truncated, self.plans_manager,
-                        #          self.configuration_manager,
-                        #          properties,
-                        #          self.dataset_json,
-                        #          default_num_processes,
-                        #          dataset_class)
-                        results.append(segmentation_export_pool.starmap_async(
-                            resample_and_save, (
-                                (prediction, target_shape, output_file_truncated, self.plans_manager,
-                                 self.configuration_manager,
-                                 properties,
-                                 self.dataset_json,
-                                 default_num_processes,
-                                 dataset_class),
-                            )
-                        ))
-                # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
-                if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
-                    dist.barrier()
+                            # resample_and_save(prediction, target_shape, output_file_truncated, self.plans_manager,
+                            #          self.configuration_manager,
+                            #          properties,
+                            #          self.dataset_json,
+                            #          default_num_processes,
+                            #          dataset_class)
+                            results.append(segmentation_export_pool.starmap_async(
+                                resample_and_save, (
+                                    (prediction, target_shape, output_file_truncated, self.plans_manager,
+                                     self.configuration_manager,
+                                     properties,
+                                     self.dataset_json,
+                                     default_num_processes,
+                                     dataset_class),
+                                )
+                            ))
+                    # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
+                    if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+                        dist.barrier()
 
             _ = [r.get() for r in results]
 
