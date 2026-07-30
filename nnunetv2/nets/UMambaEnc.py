@@ -33,10 +33,7 @@ class MambaLayer(nn.Module):
                 expand=expand,    # Block expansion factor
         )
     
-    @autocast(enabled=False)
     def forward(self, x):
-        if x.dtype == torch.float16:
-            x = x.type(torch.float32)
         B, C = x.shape[:2]
         assert C == self.dim
         n_tokens = x.shape[2:].numel()

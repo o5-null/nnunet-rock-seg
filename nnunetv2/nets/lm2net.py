@@ -77,8 +77,6 @@ class MambaLayer(nn.Module):
         self.skip_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
-        if x.dtype == torch.float16:
-            x = x.type(torch.float32)
         B, C = x.shape[:2]
         assert C == self.input_dim
         n_tokens = x.shape[2:].numel()

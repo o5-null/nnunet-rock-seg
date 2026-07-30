@@ -24,6 +24,15 @@ class nnUNetTrainerLightSS2DMambaUNet(nnUNetTrainer_MedNeXtBase):
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
 
+    def _do_i_compile(self) -> bool:
+        """
+        SS2D-Mamba 网络大量小 forward 嵌套，Dynamo 因 AMP
+        (fp16/fp32) 和 train/val (grad_mode) 交替触发反复重编译。
+        Mamba/SS2D CUDA kernel 已是手写优化，compile 收益极低，
+        直接关闭以避免重编译开销和日志噪音。
+        """
+        return False
+
     def set_deep_supervision_enabled(self, enabled: bool):
         """
         浅层设置，实际网络 forward() 不检查 deep_supervision 标志。

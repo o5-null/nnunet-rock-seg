@@ -268,6 +268,10 @@ class nnUNetTrainer(object):
                     self.label_manager.num_segmentation_heads,
                     self.enable_deep_supervision
                 ).to(self.device)
+            # Mamba 的 causal_conv1d_cuda 是 C 扩展，Dynamo 无法追踪
+            warnings.filterwarnings("ignore", category=UserWarning,
+                                    module="torch._dynamo",
+                                    message=".*causal_conv1d_cuda.*causal_conv1d_fwd.*")
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
@@ -361,13 +365,29 @@ class nnUNetTrainer(object):
                 self.print_to_log_file("INFO: torch.compile disabled because device is CPU")
             return False
 
-        # default torch.compile doesn't work on windows because there are apparently no triton wheels for it
-        # https://discuss.pytorch.org/t/windows-support-timeline-for-torch-compile/182268/2
+        # Windows + torch.compile: 自动检测 triton，可用则默认启用。
+        # 设 nnUNet_compile=0 可强制禁用，=1 可强制启用。
         if os.name == 'nt':
-            if 'nnUNet_compile' in os.environ.keys() and os.environ['nnUNet_compile'].lower() in ('true', '1', 't'):
-                self.print_to_log_file("INFO: torch.compile disabled because Windows is not natively supported. If "
-                                       "you know what you are doing, check https://discuss.pytorch.org/t/windows-support-timeline-for-torch-compile/182268/2")
-            return False
+            # 环境变量显式指定时优先
+            if 'nnUNet_compile' in os.environ.keys():
+                val = os.environ['nnUNet_compile'].lower()
+                if val in ('true', '1', 't'):
+                    self.print_to_log_file("INFO: torch.compile enabled on Windows via nnUNet_compile=1")
+                    return True
+                elif val in ('false', '0', 'f'):
+                    self.print_to_log_file("INFO: torch.compile disabled on Windows via nnUNet_compile=0")
+                    return False
+            # 未显式设置时自动检测 triton
+            try:
+                import triton
+                self.print_to_log_file(f"INFO: triton {triton.__version__} detected, torch.compile enabled")
+                return True
+            except ImportError:
+                self.print_to_log_file(
+                    "INFO: triton not found, torch.compile disabled on Windows. "
+                    "Install via: uv pip install triton-windows-xxx"
+                )
+                return False
 
         if 'nnUNet_compile' not in os.environ.keys():
             return True

@@ -11,7 +11,8 @@ def create_mednextv1_small(num_input_channels, num_classes, kernel_size=3, ds=Fa
         deep_supervision=ds,             
         do_res=True,                     
         do_res_up_down = True,
-        block_counts = [2,2,2,2,2,2,2,2,2]
+        block_counts = [2,2,2,2,2,2,2,2,2],
+        dim='2d',
     )
 
 
@@ -26,7 +27,8 @@ def create_mednextv1_base(num_input_channels, num_classes, kernel_size=3, ds=Fal
         deep_supervision=ds,             
         do_res=True,                     
         do_res_up_down = True,
-        block_counts = [2,2,2,2,2,2,2,2,2]
+        block_counts = [2,2,2,2,2,2,2,2,2],
+        dim='2d',
     )
 
 
@@ -42,7 +44,8 @@ def create_mednextv1_medium(num_input_channels, num_classes, kernel_size=3, ds=F
         do_res=True,                     
         do_res_up_down = True,
         block_counts = [3,4,4,4,4,4,4,4,3],
-        checkpoint_style = 'outside_block'
+        checkpoint_style = 'outside_block',
+        dim='2d',
     )
 
 
@@ -58,7 +61,8 @@ def create_mednextv1_large(num_input_channels, num_classes, kernel_size=3, ds=Fa
         do_res=True,                     
         do_res_up_down = True,
         block_counts = [3,4,8,8,8,8,8,4,3],
-        checkpoint_style = 'outside_block'
+        checkpoint_style = 'outside_block',
+        dim='2d',
     )
 
 

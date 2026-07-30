@@ -80,9 +80,8 @@ class MambaLayer(nn.Module):
         img_dims = x.shape[2:]
         x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
         x_norm = self.norm(x_flat)
-        # Mamba2/SSM 核心离散化（A_log/dt 指数运算）在 fp16 下动态范围不足容易 NaN。
-        # 嵌套 bf16 AMP 上下文，仅让 SSM 相关运算走 bf16（8 位指数 = fp32 级别），
-        # 不干扰外部 fp16 AMP 上下文中 conv/loss/precision 的正常计算。
+        # Mamba2 SSM 离散化（A_log/dt 指数运算）在 fp16 下动态范围不足容易 NaN。
+        # bf16（8 位指数 = fp32 级别）可避免此问题，且不影响外部 fp16 AMP 上下文。
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=x.is_cuda):
             x_mamba = self.mamba(x_norm)
         x_mamba = x_mamba.to(x.dtype) + self.skip_scale * x_flat

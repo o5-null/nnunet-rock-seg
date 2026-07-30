@@ -295,19 +295,15 @@ class MambaLayer(nn.Module):
         self.skip_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
-        if x.dtype == torch.float16:
-            x = x.type(torch.float32)
+        # 稳定输入 dtype，避免 Dynamo 因 AMP 切换 fp16/fp32 反复重编译
+        x = x.float()
         B, C, H, W = x.shape
         assert C == self.input_dim
         x_permute = x.permute(0, 2, 3, 1)
-        # n_tokens = x.shape[2:].numel()
-        # img_dims = x.shape[2:]
-        # x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
         x_norm = self.input_norm(x_permute)
         x_mamba = self.mamba(x_norm) + self.skip_scale * x_permute
         x_mamba = self.output_norm(x_mamba)
         x_mamba = self.proj(x_mamba)
-        # out = x_mamba.transpose(-1, -2).reshape(B, self.output_dim, *img_dims)
         out = x_mamba.permute(0, 3, 1, 2)
         return out
 

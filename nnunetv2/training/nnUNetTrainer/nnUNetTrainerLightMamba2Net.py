@@ -24,8 +24,9 @@ class nnUNetTrainerLightMamba2Net(nnUNetTrainer_MedNeXtBase):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
-        # AMP 使用继承的 fp16（基类默认）。Mamba2 层在 MambaLayer 内部转为 bf16 计算，
-        # 避免 SSM 在 fp16 下的数值不稳定问题，同时不拖慢 conv/loss 的 fp16 性能。
+        # 保持 AMP 为 fp16（基类默认）。Mamba2 SSM 的 A_log/dt 指数运算在 fp16 下
+        # 动态范围不足容易 NaN，MambaLayer 内部单独用 bf16 包裹 SSM 调用（仅降此一级）。
+        # conv 层和 loss 计算走 fp16（速度优势），互不影响。
 
     def _get_deep_supervision_scales(self):
         """
