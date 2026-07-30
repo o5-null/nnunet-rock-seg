@@ -1450,13 +1450,16 @@ class nnUNetTrainer(object):
             disable_tqdm = self.local_rank != 0
             _val_keys = list(dataset_val.identifiers)
 
-            # 多线程验证：并行加载数据 + 串行 GPU 推理，重叠 I/O 与计算
+            # 多线程验证：并行加载数据 + 并行 GPU 推理（per-thread CUDA stream）
             import threading
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            _gpu_lock = threading.Lock()
+
+            # 每个线程使用独立的 CUDA stream 实现 GPU 推理并行化
+            # 纯推理（inference_mode）下同模型并行 forward 是安全的
+            _thread_streams = threading.local()
 
             def _val_worker(k):
-                """单张验证：加载、预处理、GPU 推理（由锁串行化）"""
+                """单张验证：加载、预处理、GPU 推理（per-thread CUDA stream）"""
                 data, _, seg_prev, properties = dataset_val.load_case(k)
                 data = data[:]
                 if self.is_cascaded:
@@ -1466,7 +1469,12 @@ class nnUNetTrainer(object):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     data = torch.from_numpy(data)
-                with _gpu_lock:
+                if self.device.type == 'cuda':
+                    if not hasattr(_thread_streams, 'stream'):
+                        _thread_streams.stream = torch.cuda.Stream(device=self.device)
+                    with torch.cuda.stream(_thread_streams.stream):
+                        prediction = predictor.predict_sliding_window_return_logits(data)
+                else:
                     prediction = predictor.predict_sliding_window_return_logits(data)
                 return k, prediction.cpu(), properties
 
