@@ -1445,96 +1445,98 @@ class nnUNetTrainer(object):
                 _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
 
             results = []
+            num_val_workers = max(2, min(8, int(os.environ.get('nnUNet_n_proc_DA', '4'))))
 
             disable_tqdm = self.local_rank != 0
-            with tqdm(dataset_val.identifiers, desc="Val", unit="img",
-                      disable=disable_tqdm) as pbar:
-                for i, k in enumerate(pbar):
-                    proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
-                                                               allowed_num_queued=2)
-                    while not proceed:
-                        sleep(0.1)
-                        proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
-                                                                   allowed_num_queued=2)
+            _val_keys = list(dataset_val.identifiers)
 
-                    data, _, seg_prev, properties = dataset_val.load_case(k)
+            # 多线程验证：并行加载数据 + 串行 GPU 推理，重叠 I/O 与计算
+            import threading
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            _gpu_lock = threading.Lock()
 
-                    # we do [:] to convert blosc2 to numpy
-                    data = data[:]
-
-                    if self.is_cascaded:
-                        seg_prev = seg_prev[:]
-                        data = np.vstack((data, convert_labelmap_to_one_hot(seg_prev, self.label_manager.foreground_labels,
-                                                                            output_dtype=data.dtype)))
-                    with warnings.catch_warnings():
-                        # ignore 'The given NumPy array is not writable' warning
-                        warnings.simplefilter("ignore")
-                        data = torch.from_numpy(data)
-
-                    pbar.set_postfix_str(k)
-
-                    output_filename_truncated = join(validation_output_folder, k)
-
+            def _val_worker(k):
+                """单张验证：加载、预处理、GPU 推理（由锁串行化）"""
+                data, _, seg_prev, properties = dataset_val.load_case(k)
+                data = data[:]
+                if self.is_cascaded:
+                    seg_prev = seg_prev[:]
+                    data = np.vstack((data, convert_labelmap_to_one_hot(
+                        seg_prev, self.label_manager.foreground_labels, output_dtype=data.dtype)))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    data = torch.from_numpy(data)
+                with _gpu_lock:
                     prediction = predictor.predict_sliding_window_return_logits(data)
-                    prediction = prediction.cpu()
+                return k, prediction.cpu(), properties
 
-                    # this needs to go into background processes
-                    results.append(
-                        segmentation_export_pool.starmap_async(
-                            export_prediction_from_logits, (
-                                (prediction, properties, self.configuration_manager, self.plans_manager,
-                                 self.dataset_json, output_filename_truncated, save_probabilities),
+            with ThreadPoolExecutor(max_workers=num_val_workers) as executor:
+                futures = {executor.submit(_val_worker, k): k for k in _val_keys}
+                with tqdm(total=len(_val_keys), desc="Val", unit="img",
+                          disable=disable_tqdm) as pbar:
+                    for i, future in enumerate(as_completed(futures)):
+                        k, prediction, properties = future.result()
+                        pbar.set_postfix_str(k)
+
+                        # export backpressure
+                        proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list,
+                                                                   results, allowed_num_queued=2)
+                        while not proceed:
+                            sleep(0.1)
+                            proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list,
+                                                                       results, allowed_num_queued=2)
+
+                        output_filename_truncated = join(validation_output_folder, k)
+
+                        # submit export
+                        results.append(
+                            segmentation_export_pool.starmap_async(
+                                export_prediction_from_logits, (
+                                    (prediction, properties, self.configuration_manager, self.plans_manager,
+                                     self.dataset_json, output_filename_truncated, save_probabilities),
+                                )
                             )
                         )
-                    )
-                    # for debug purposes
-                    # export_prediction_from_logits(
-                    #     prediction, properties, self.configuration_manager, self.plans_manager,
-                    #      self.dataset_json, output_filename_truncated, save_probabilities
-                    # )
 
-                    # if needed, export the softmax prediction for the next stage
-                    if next_stages is not None:
-                        for n in next_stages:
-                            next_stage_config_manager = self.plans_manager.get_configuration(n)
-                            expected_preprocessed_folder = join(nnUNet_preprocessed, self.plans_manager.dataset_name,
-                                                                next_stage_config_manager.data_identifier)
-                            # next stage may have a different dataset class, do not use self.dataset_class
-                            dataset_class = infer_dataset_class(expected_preprocessed_folder)
+                        # if needed, export the softmax prediction for the next stage
+                        if next_stages is not None:
+                            for n in next_stages:
+                                next_stage_config_manager = self.plans_manager.get_configuration(n)
+                                expected_preprocessed_folder = join(nnUNet_preprocessed,
+                                                                    self.plans_manager.dataset_name,
+                                                                    next_stage_config_manager.data_identifier)
+                                dataset_class = infer_dataset_class(expected_preprocessed_folder)
 
-                            try:
-                                # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
-                                tmp = dataset_class(expected_preprocessed_folder, [k])
-                                d, _, _, _ = tmp.load_case(k)
-                            except FileNotFoundError:
-                                self.print_to_log_file(
-                                    f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "
-                                    f"Run the preprocessing for this configuration first!")
-                                continue
+                                try:
+                                    tmp = dataset_class(expected_preprocessed_folder, [k])
+                                    d, _, _, _ = tmp.load_case(k)
+                                except FileNotFoundError:
+                                    self.print_to_log_file(
+                                        f"Predicting next stage {n} failed for case {k} because "
+                                        f"the preprocessed file is missing! "
+                                        f"Run the preprocessing for this configuration first!")
+                                    continue
 
-                            target_shape = d.shape[1:]
-                            output_folder = join(self.output_folder_base, 'predicted_next_stage', n)
-                            output_file_truncated = join(output_folder, k)
+                                target_shape = d.shape[1:]
+                                output_folder = join(self.output_folder_base, 'predicted_next_stage', n)
+                                output_file_truncated = join(output_folder, k)
 
-                            # resample_and_save(prediction, target_shape, output_file_truncated, self.plans_manager,
-                            #          self.configuration_manager,
-                            #          properties,
-                            #          self.dataset_json,
-                            #          default_num_processes,
-                            #          dataset_class)
-                            results.append(segmentation_export_pool.starmap_async(
-                                resample_and_save, (
-                                    (prediction, target_shape, output_file_truncated, self.plans_manager,
-                                     self.configuration_manager,
-                                     properties,
-                                     self.dataset_json,
-                                     default_num_processes,
-                                     dataset_class),
-                                )
-                            ))
-                    # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
-                    if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
-                        dist.barrier()
+                                results.append(segmentation_export_pool.starmap_async(
+                                    resample_and_save, (
+                                        (prediction, target_shape, output_file_truncated, self.plans_manager,
+                                         self.configuration_manager,
+                                         properties,
+                                         self.dataset_json,
+                                         default_num_processes,
+                                         dataset_class),
+                                    )
+                                ))
+
+                        # DDP barrier every 20 items
+                        if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+                            dist.barrier()
+
+                        pbar.update()
 
             _ = [r.get() for r in results]
 
