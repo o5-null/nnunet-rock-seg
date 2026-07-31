@@ -44,6 +44,8 @@ def resample_torch_simple(
             input_was_numpy = isinstance(data, np.ndarray)
             if input_was_numpy:
                 data = torch.from_numpy(data).to(device)
+                # numpy 输入走 result.cpu().numpy() 分支，不会用到 orig_device
+                orig_device = None
             else:
                 orig_device = deepcopy(data.device)
                 data = data.to(device)

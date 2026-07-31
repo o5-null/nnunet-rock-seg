@@ -1226,7 +1226,12 @@ class nnUNetTrainer(object):
 
     def on_train_epoch_start(self):
         self.network.train()
-        self.lr_scheduler.step(self.current_epoch)
+        # PolyLRScheduler 是闭式形式，lr 直接由 current_epoch 计算，不依赖 optimizer.step 计数。
+        # 但 PyTorch 会对 "step() 先于 optimizer.step()" 与显式 epoch 参数发出无害 UserWarning，
+        # 每 epoch 刷屏，此处静默之。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            self.lr_scheduler.step(self.current_epoch)
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
@@ -1612,6 +1617,8 @@ class nnUNetTrainer(object):
             # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
             # the validation keys across the workers.
             _, val_keys = self.do_split()
+            # 非 DDP 时该值不会被使用（下方 is_ddp 短路），提前初始化仅为类型检查器保证绑定
+            last_barrier_at_idx = 0
             if self.is_ddp:
                 last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
 

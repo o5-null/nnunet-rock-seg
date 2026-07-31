@@ -125,6 +125,7 @@ class SwinTransformerUnet(nn.Module):
         return l_x, r_x
 
     def forward(self, x):
+        last_add = None
         if self.add_last:
             last_add = self.rebnconvin(x)
         x = self.patch_embed(x)
@@ -150,6 +151,7 @@ class SwinTransformerUnet(nn.Module):
         x = rearrange(x, 'B H W C -> B C H W')
         x = self.head(x)
         if self.add_last:
+            assert last_add is not None, "add_last requires rebnconvin output"
             x = x + last_add
         return x
 

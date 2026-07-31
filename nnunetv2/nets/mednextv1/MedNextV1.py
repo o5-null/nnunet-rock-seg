@@ -41,7 +41,7 @@ class MedNeXt(nn.Module):
 
         if dim == '2d':
             conv = nn.Conv2d
-        elif dim == '3d':
+        else:
             conv = nn.Conv3d
             
         self.stem = conv(in_channels, n_channels, kernel_size=1)
@@ -290,6 +290,11 @@ class MedNeXt(nn.Module):
     def forward(self, x):
         
         x = self.stem(x)
+        # 预绑定 deep supervision 输出，forward 内有 outside_block_checkpointing 两大分支，
+        # 任一分支只赋值部分 x_ds_*，类型检查器无法跨分支证明绑定
+        x_ds_1 = x_ds_2 = x_ds_3 = x_ds_4 = None
+        # 缓存到局部变量，让类型检查器能跨多个 if 窄化 do_ds
+        do_ds = self.do_ds
         if self.outside_block_checkpointing:
             x_res_0 = self.iterative_checkpoint(self.enc_block_0, x)
             x = checkpoint.checkpoint(self.down_0, x_res_0, self.dummy_tensor)
@@ -301,27 +306,27 @@ class MedNeXt(nn.Module):
             x = checkpoint.checkpoint(self.down_3, x_res_3, self.dummy_tensor)
 
             x = self.iterative_checkpoint(self.bottleneck, x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_4 = checkpoint.checkpoint(self.out_4, x, self.dummy_tensor)
 
             x_up_3 = checkpoint.checkpoint(self.up_3, x, self.dummy_tensor)
             dec_x = x_res_3 + x_up_3 
             x = self.iterative_checkpoint(self.dec_block_3, dec_x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_3 = checkpoint.checkpoint(self.out_3, x, self.dummy_tensor)
             del x_res_3, x_up_3
 
             x_up_2 = checkpoint.checkpoint(self.up_2, x, self.dummy_tensor)
             dec_x = x_res_2 + x_up_2 
             x = self.iterative_checkpoint(self.dec_block_2, dec_x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_2 = checkpoint.checkpoint(self.out_2, x, self.dummy_tensor)
             del x_res_2, x_up_2
 
             x_up_1 = checkpoint.checkpoint(self.up_1, x, self.dummy_tensor)
             dec_x = x_res_1 + x_up_1 
             x = self.iterative_checkpoint(self.dec_block_1, dec_x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_1 = checkpoint.checkpoint(self.out_1, x, self.dummy_tensor)
             del x_res_1, x_up_1
 
@@ -343,28 +348,28 @@ class MedNeXt(nn.Module):
             x = self.down_3(x_res_3)
 
             x = self.bottleneck(x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_4 = self.out_4(x)
 
             x_up_3 = self.up_3(x)
             dec_x = x_res_3 + x_up_3 
             x = self.dec_block_3(dec_x)
 
-            if self.do_ds:
+            if do_ds:
                 x_ds_3 = self.out_3(x)
             del x_res_3, x_up_3
 
             x_up_2 = self.up_2(x)
             dec_x = x_res_2 + x_up_2 
             x = self.dec_block_2(dec_x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_2 = self.out_2(x)
             del x_res_2, x_up_2
 
             x_up_1 = self.up_1(x)
             dec_x = x_res_1 + x_up_1 
             x = self.dec_block_1(dec_x)
-            if self.do_ds:
+            if do_ds:
                 x_ds_1 = self.out_1(x)
             del x_res_1, x_up_1
 
@@ -375,7 +380,9 @@ class MedNeXt(nn.Module):
 
             x = self.out_0(x)
 
-        if self.do_ds:
+        if do_ds:
+            assert x_ds_1 is not None and x_ds_2 is not None and x_ds_3 is not None and x_ds_4 is not None, \
+                "deep supervision outputs must be assigned when do_ds=True"
             return [x, x_ds_1, x_ds_2, x_ds_3, x_ds_4]
         else: 
             return x
@@ -418,8 +425,8 @@ if __name__ == "__main__":
 
     print(count_parameters(network))
 
-    from fvcore.nn import FlopCountAnalysis
-    from fvcore.nn import parameter_count_table
+    from fvcore.nn import FlopCountAnalysis  # pyright: ignore[reportMissingImports]  # 可选依赖(main测试块)
+    from fvcore.nn import parameter_count_table  # pyright: ignore[reportMissingImports]  # 可选依赖(main测试块)
 
     # model = ResTranUnet(img_size=128, in_channels=1, num_classes=14, dummy=False).cuda()
     x = torch.zeros((1,1,64,64,64), requires_grad=False).cuda()

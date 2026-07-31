@@ -562,6 +562,9 @@ class UNetResDecoder(nn.Module):
         dpr = [x.item() for x in torch.linspace(drop_path_rate, 0, (n_stages_encoder - 1) * 2)]
         depths = [2, 2, 2, 2]
 
+        # 预绑定：循环可能不执行（n_stages_encoder<=1），保证下方 final prediction 安全
+        input_features_skip = encoder_output_channels[-1]
+
         # we start with the bottleneck and work out way up
         stages = []
         expand_layers = []

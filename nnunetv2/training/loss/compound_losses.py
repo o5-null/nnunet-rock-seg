@@ -46,6 +46,8 @@ class DC_and_CE_loss(nn.Module):
         else:
             target_dice = target
             mask = None
+            # else 分支 ignore_label 为 None，下方条件短路不会求值 num_fg；此处仅保证类型检查器绑定
+            num_fg = 0
 
         dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \
             if self.weight_dice != 0 else 0
@@ -146,6 +148,8 @@ class DC_and_topk_loss(nn.Module):
         else:
             target_dice = target
             mask = None
+            # else 分支 ignore_label 为 None，下方条件短路不会求值 num_fg；此处仅保证类型检查器绑定
+            num_fg = 0
 
         dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \
             if self.weight_dice != 0 else 0

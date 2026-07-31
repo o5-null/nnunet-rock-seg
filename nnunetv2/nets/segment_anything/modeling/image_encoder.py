@@ -167,15 +167,21 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
+        # 预绑定，仅用于满足类型检查器跨两个 if 的绑定证明
+        pad_hw = None
+        H = 0
+        W = 0
         # Window partition
-        if self.window_size > 0:
+        # 缓存到局部变量，让类型检查器能跨两个 if 窄化 window_size
+        window_size = self.window_size
+        if window_size > 0:
             H, W = x.shape[1], x.shape[2]
-            x, pad_hw = window_partition(x, self.window_size)  # [B * num_windows, window_size, window_size, C]
+            x, pad_hw = window_partition(x, window_size)  # [B * num_windows, window_size, window_size, C]
 
         x = self.attn(x)
         # Reverse window partition
-        if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+        if window_size > 0:
+            x = window_unpartition(x, window_size, pad_hw, (H, W))
 
         x = shortcut + x
         x = x + self.mlp(self.norm2(x))

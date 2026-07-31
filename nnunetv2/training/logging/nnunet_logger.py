@@ -10,7 +10,7 @@ import shutil
 import os
 
 try:
-    import wandb
+    import wandb  # pyright: ignore[reportMissingImports]  # 可选依赖
 except ImportError:
     wandb = None
 

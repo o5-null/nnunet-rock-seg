@@ -13,6 +13,8 @@ from monai.utils import ensure_tuple_rep
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 from dynamic_network_architectures.initialization.weight_init import init_last_bn_before_add_to_0
 from nnunetv2.utilities.network_initialization import InitWeights_He
+from mamba_ssm import Mamba
+from mamba_ssm.ops.triton.layer_norm import RMSNorm, rms_norm_fn, layer_norm_fn
 
 import collections
 import inspect
@@ -1541,6 +1543,7 @@ class UNETR(nn.Module):
     #     return x
 
     def forward(self, x_in):
+        last_add = None
         if self.add_last:
             last_add = self.rebnconvin(x_in)
 
@@ -1559,6 +1562,7 @@ class UNETR(nn.Module):
         out = self.decoder2(dec1, enc1)
         out = self.out(out)
         if self.add_last:
+            assert last_add is not None, "add_last requires rebnconvin output"
             out = out + last_add
         return out
 

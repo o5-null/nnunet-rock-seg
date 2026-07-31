@@ -25,7 +25,7 @@ class MedNeXtBlock(nn.Module):
         self.dim = dim
         if self.dim == '2d':
             conv = nn.Conv2d
-        elif self.dim == '3d':
+        else:
             conv = nn.Conv3d
             
         # First convolution layer with DepthWise Convolutions
@@ -91,7 +91,7 @@ class MedNeXtBlock(nn.Module):
             # X: input of shape (N,C,H,W,D)
             if self.dim == '3d':
                 gx = torch.norm(x1, p=2, dim=(-3, -2, -1), keepdim=True)
-            elif self.dim == '2d':
+            else:
                 gx = torch.norm(x1, p=2, dim=(-2, -1), keepdim=True)
             nx = gx / (gx.mean(dim=1, keepdim=True)+1e-6)
             x1 = self.grn_gamma * (x1 * nx) + self.grn_beta + x1
@@ -112,7 +112,7 @@ class MedNeXtDownBlock(MedNeXtBlock):
 
         if dim == '2d':
             conv = nn.Conv2d
-        elif dim == '3d':
+        else:
             conv = nn.Conv3d
         self.resample_do_res = do_res
         if do_res:
@@ -156,7 +156,7 @@ class MedNeXtUpBlock(MedNeXtBlock):
         self.dim = dim
         if dim == '2d':
             conv = nn.ConvTranspose2d
-        elif dim == '3d':
+        else:
             conv = nn.ConvTranspose3d
         if do_res:            
             self.res_conv = conv(
@@ -204,7 +204,7 @@ class OutBlock(nn.Module):
         
         if dim == '2d':
             conv = nn.ConvTranspose2d
-        elif dim == '3d':
+        else:
             conv = nn.ConvTranspose3d
         self.conv_out = conv(in_channels, n_classes, kernel_size=1)
     

@@ -17,11 +17,10 @@ except ImportError:
 
 
 try:
-    from nnunetv2.nets.seg_mamba.selective_scan_interface import bimamba_inner_fn, mamba_inner_fn_no_out_proj, selective_scan_fn, mamba_inner_fn
+    from nnunetv2.nets.seg_mamba.selective_scan_interface import mamba_inner_fn_no_out_proj, selective_scan_fn, mamba_inner_fn
 except ImportError:
-    print("[WARNING] Could not import bimamba_inner_fn")
-    # mamba_inner_fn_no_out_proj, bimamba_inner_fn = None, None
-    # selective_scan_fn, mamba_inner_fn = None, None
+    print("[WARNING] Could not import mamba selective scan kernels")
+    mamba_inner_fn_no_out_proj, selective_scan_fn, mamba_inner_fn = None, None, None
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -29,7 +28,7 @@ except ImportError:
     selective_state_update = None
 
 try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+    from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
@@ -215,6 +214,8 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
+            assert mamba_inner_fn is not None and mamba_inner_fn_no_out_proj is not None, \
+                "Mamba fast path requires compiled mamba_ssm selective scan kernels"
             if self.bimamba_type == "v3":
                 A_b = -torch.exp(self.A_b_log.float())
                 out = mamba_inner_fn_no_out_proj(
@@ -337,6 +338,7 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
+            assert selective_scan_fn is not None, "selective_scan_fn requires compiled mamba_ssm kernels"
             y = selective_scan_fn(
                 x,
                 dt,

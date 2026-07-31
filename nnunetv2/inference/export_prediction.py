@@ -21,6 +21,9 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
     old_threads = torch.get_num_threads()
     torch.set_num_threads(num_threads_torch)
 
+    # 预绑定以保证后续 if return_probabilities 分支引用时类型检查器的安全
+    predicted_probabilities = None
+
     # resample to original shape
     spacing_transposed = [properties_dict['spacing'][i] for i in plans_manager.transpose_forward]
     current_spacing = configuration_manager.spacing if \

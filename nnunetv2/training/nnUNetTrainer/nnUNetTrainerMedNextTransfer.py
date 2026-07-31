@@ -539,7 +539,7 @@ class nnUNetTrainerV2_MedNeXt_B_TransferLearning(nnUNetTrainerV2_MedNeXt_B_kerne
         
         if torch.isnan(data).any() or torch.isinf(data).any():
             self.print_to_log_file(f"[WARNING] NaN/Inf after augmentation, skipping")
-            return batch['data'].to(self.device, non_blocking=True), target
+            return data.to(self.device, non_blocking=True), target
         
         return data, target
     

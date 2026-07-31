@@ -549,6 +549,8 @@ class U2NETP(nn.Module):
     def forward(self, x):
         imgs = x
         hx = x
+        # 预绑定 mask_gen，仅 self.mae=True 时赋值/使用；实例属性窄化不跨语句
+        mask_gen = None
 
         # stage 1
         hx1 = self.stage1(hx)

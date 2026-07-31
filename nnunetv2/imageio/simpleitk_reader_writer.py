@@ -137,6 +137,8 @@ class SimpleITKIOWithReorient(SimpleITKIO):
         directions = []
 
         spacings_for_nnunet = []
+        # 预绑定：for 循环可能为空（image_fnames 为空），保证下方 dict 引用安全
+        original_orientation = None
         for f in image_fnames:
             itk_image = sitk.ReadImage(f)
             original_orientation = sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(itk_image.GetDirection())

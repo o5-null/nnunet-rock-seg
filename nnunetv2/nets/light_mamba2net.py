@@ -662,12 +662,15 @@ class LightMUNet(nn.Module):
             self.dropout = Dropout[Dropout.DROPOUT, spatial_dims](dropout_prob)
 
     def _get_down_samples(self):
+        # 计算最多可下采样多少次（任一分辨率小于 min_size 即停止）
         n_scales = 0
+        input_path_size = np.array(self.input_path_size)
         for _ in range(self.n_layers):
             for x in input_path_size:
                 if x < self.min_size:
-                    break
-            input_path_size = np.array(self.input_path_size) / 2
+                    return n_scales
+            input_path_size = input_path_size / 2
+            n_scales += 1
         return n_scales
 
     def _make_down_layers(self):

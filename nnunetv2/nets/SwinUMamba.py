@@ -684,6 +684,10 @@ def get_swin_umamba_from_plans(
 
 
 if __name__ == '__main__':
+    # main 测试块内延迟导入，避免模块级循环依赖 / 未安装依赖导致导入失败
+    from nnunetv2.nets.LightSS2DMambaUNet import LightSS2DMambaUNet
+    from torchinfo import summary
+
     in_channels = 1
     bs = 2
     patch_size = [256, 256]

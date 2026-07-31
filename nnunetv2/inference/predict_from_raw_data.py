@@ -85,6 +85,10 @@ class nnUNetPredictor(object):
             use_folds = [use_folds]
 
         parameters = []
+        # 防御性初始化：use_folds 为空时避免 UnboundLocalError，下方 assert 会给出清晰报错
+        trainer_name = None
+        configuration_name = None
+        inference_allowed_mirroring_axes = None
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
             checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
@@ -96,6 +100,9 @@ class nnUNetPredictor(object):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
 
             parameters.append(checkpoint['network_weights'])
+
+        assert trainer_name is not None and configuration_name is not None, \
+            f"use_folds={use_folds} must contain at least one fold to read trainer/configuration info"
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
@@ -807,6 +814,10 @@ class nnUNetPredictor(object):
             #    3D: data.shape[2:] = (H', W', D')
             slicers = self._internal_get_sliding_window_slicers(data.shape[2:])
 
+            # 提前绑定到 try 之外，保证 except 分支的 del 不会因变量未定义而抛 NameError
+            predicted_logits = None
+            n_predictions = None
+            data_gpu = None
             try:
                 data_gpu = data.to(self.device, non_blocking=True)
 

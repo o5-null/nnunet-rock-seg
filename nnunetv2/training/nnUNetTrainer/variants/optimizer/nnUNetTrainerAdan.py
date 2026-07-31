@@ -4,7 +4,7 @@ from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 try:
-    from adan_pytorch import Adan
+    from adan_pytorch import Adan  # pyright: ignore[reportMissingImports]  # 可选依赖
 except ImportError:
     Adan = None
 

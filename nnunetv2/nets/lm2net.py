@@ -46,7 +46,7 @@ class MaxPool(nn.Module):
         return self.max_pool(input)
 
 
-def get_dwconv_layer(
+def get_dwconv_layer(  # pyright: ignore[reportRedeclaration]  # 与文件后续同名定义重复，后者实际生效
         spatial_dims: int,
         in_channels: int,
         out_channels: int,
@@ -278,12 +278,15 @@ class LightMUNet(nn.Module):
             self.dropout = Dropout[Dropout.DROPOUT, spatial_dims](dropout_prob)
 
     def _get_down_samples(self):
+        # 计算最多可下采样多少次（任一分辨率小于 min_size 即停止）
         n_scales = 0
+        input_path_size = np.array(self.input_path_size)
         for _ in range(self.n_layers):
             for x in input_path_size:
                 if x < self.min_size:
-                    break
-            input_path_size = np.array(self.input_path_size) / 2
+                    return n_scales
+            input_path_size = input_path_size / 2
+            n_scales += 1
         return n_scales
 
     def _make_down_layers(self):
@@ -377,6 +380,7 @@ class LightMUNet(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        last_add = None
         if self.add_last:
             last_add = self.rebnconvin(x)
         x, down_x = self.encode(x)
@@ -384,6 +388,7 @@ class LightMUNet(nn.Module):
 
         x = self.decode(x, down_x)
         if self.add_last:
+            assert last_add is not None, "add_last requires rebnconvin output"
             x = x + last_add
         return x
 

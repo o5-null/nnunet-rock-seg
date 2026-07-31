@@ -335,7 +335,7 @@ from einops import rearrange
 from monai.networks.blocks import Convolution
 
 
-def get_dwconv_layer(
+def get_dwconv_layer(  # pyright: ignore[reportRedeclaration]  # 与文件后续同名定义重复，后者实际生效
         spatial_dims: int,
         in_channels: int,
         out_channels: int,
@@ -350,7 +350,7 @@ def get_dwconv_layer(
     return torch.nn.Sequential(depth_conv, point_conv)
 
 
-class SwinTransformerBlock(nn.Module):
+class SwinTransformerBlock(nn.Module):  # pyright: ignore[reportRedeclaration]  # 与文件后续同名类重复，后者实际生效
     def __init__(self, dim, num_heads, window_size=7, shift=False, mlp_ratio=4., qkv_bias=True,
                  drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -840,6 +840,7 @@ class SwinTransformerUnet(nn.Module):
         return l_x, r_x
 
     def forward(self, x):
+        last_add = None
         if self.add_last:
             last_add = self.rebnconvin(x)
         x = self.patch_embed(x)
