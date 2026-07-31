@@ -39,6 +39,24 @@ class nnUNetTrainerSwinUNETR(nnUNetTrainer_MedNeXtBase):
         self.initial_lr = 8e-4
         self.weight_decay = 0.01
 
+    def _do_i_compile(self) -> bool:
+        """禁用 torch.compile。
+
+        Windows 上 inductor 走 C++ 后端，编译时依赖环境变量 INCLUDE 定位 MSVC
+        标准头文件（含 omp.h）。当前运行环境未设置 INCLUDE，cl.exe 编译
+        cpp_prefix.h 时报 fatal error C1083: omp.h not found（CppCompileError）。
+        SwinUNETR 参数仅 6.3M，torch.compile 收益低而编译开销大，直接禁用。
+        若需启用：请在 VS Developer Prompt（vcvarsall x64）环境中运行训练。
+        """
+        # 仅在首次调用时输出一次日志，避免多个调用点重复打印
+        if not getattr(self, '_compile_disabled_notified', False):
+            self._compile_disabled_notified = True
+            self.print_to_log_file(
+                "INFO: torch.compile disabled for SwinUNETR "
+                "(Windows C++ backend requires INCLUDE env; run under vcvarsall to enable)"
+            )
+        return False
+
     @staticmethod
     def build_network_architecture(plans_manager: PlansManager,
                                    configuration_manager: ConfigurationManager,

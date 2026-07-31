@@ -26,6 +26,13 @@ class nnUNetTrainerSwinUMamba(nnUNetTrainer_MedNeXtBase):
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
 
+    def _do_i_compile(self) -> bool:
+        """
+        SwinUMamba 网络规模大，torch.compile 编译阶段耗时且占用显存，
+        收益不明显，直接禁用编译。
+        """
+        return False
+
     def set_deep_supervision_enabled(self, enabled: bool):
         """
         模型没有 .decoder 属性，deep supervision 已通过模型内部的 self.deep_supervision 管理。

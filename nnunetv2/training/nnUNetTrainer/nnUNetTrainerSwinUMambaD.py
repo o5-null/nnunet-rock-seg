@@ -29,6 +29,13 @@ class nnUNetTrainerSwinUMambaD(nnUNetTrainer_MedNeXtBase):
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
 
+    def _do_i_compile(self) -> bool:
+        """
+        SwinUMambaD 网络规模大，torch.compile 编译阶段耗时且占用显存，
+        收益不明显，直接禁用编译。
+        """
+        return False
+
     def _get_deep_supervision_scales(self):
         """
         SwinUMambaD 的 UNetResDecoder 产生 4 个侧输出（seg_outputs[::-1] 后）:
