@@ -122,6 +122,7 @@ class nnUNetTrainer(object):
 
         ###  Saving all the init args into class variables for later access
         continue_training = plans.pop("continue_training")
+        self.continue_training = continue_training
         logger_config = {"plans": plans, "configuration": configuration, "fold": fold, "dataset": dataset_json}
         self.plans_manager = PlansManager(plans)
         self.configuration_manager = self.plans_manager.get_configuration(configuration)
@@ -323,29 +324,80 @@ class nnUNetTrainer(object):
                                "That should not happen.")
 
     def _warmup_kernels(self):
-        """Warm up custom CUDA/Triton kernels to avoid JIT compilation stalls on the first batch.
+        """Warm up cuDNN autotune + train-mode kernels to avoid stalls on epoch 0 step 1.
 
-        Default: 2 dummy forward passes. The first triggers Triton / custom kernel JIT,
-        the second verifies cache hit. Standard cuDNN ops complete instantly.
-        Subclasses can override to add architecture-specific warmup logic.
+        Phase 1 — eval forward ×2 (triggers ``cudnn.benchmark`` for conv/norm).
+        Phase 2 — full train-mode step ×2 (forward + loss + backward + optimizer
+        with AMP autocast), which warms up backward kernels, GradScaler, AMP
+        autocast dispatch, and optimizer kernel autotuning. Non-cuDNN architectures
+        (transformers, Mamba) benefit primarily from phase 2.
         """
         if self.device.type != 'cuda':
             return
 
         # DDP: all ranks must forward to pass sync barriers, but only rank 0 logs
         show_log = not (self.is_ddp and self.local_rank != 0)
+        pbar_kw = dict(disable=not show_log, leave=False)
 
+        # ---- Phase 1: cuDNN benchmark (eval forward) ----
         if show_log:
-            self.print_to_log_file("Warming up kernels (Triton JIT compilation) ...")
+            self.print_to_log_file("Phase 1/2 — cuDNN benchmark warmup (2 eval forward passes) ...")
 
         dummy = torch.randn(
             (1, self.num_input_channels, *self.configuration_manager.patch_size),
             device=self.device,
         )
         with torch.no_grad():
-            for _ in tqdm(range(2), desc="Kernel warmup", disable=not show_log,
-                          leave=False, unit="fw"):
+            for _ in tqdm(range(2), desc="cuDNN warmup", unit="fw", **pbar_kw):
                 _ = self.network(dummy)
+
+        # ---- Phase 2: full train-mode step (forward + loss + backward + optimizer) ----
+        # 继续训练时跳过：kernel shape 跟之前一样，benchmark 虽然未持久化但前向缓存已由
+        # Phase 1 重建，第一 step 的少量 backward 编译开销可接受。
+        if getattr(self, 'continue_training', False):
+            if show_log:
+                self.print_to_log_file("Phase 2/2 — Skipped (continue training).")
+        else:
+            with torch.no_grad():
+                dummy_out = self.network(dummy)
+            # DS 模式下部分网络 (SwinUMambaD/M2Net 等) 返回 list[seg...]，取主输出(全分辨率)即可
+            if isinstance(dummy_out, (list, tuple)):
+                dummy_out = dummy_out[0]
+            num_output_channels = dummy_out.shape[1]
+
+            batch_size = getattr(self, 'batch_size', 2)
+            dummy_batch = torch.randn(
+                (batch_size, self.num_input_channels, *self.configuration_manager.patch_size),
+                device=self.device,
+            )
+            dummy_target = torch.randint(
+                0, max(1, num_output_channels),
+                (batch_size, 1, *self.configuration_manager.patch_size),
+                device=self.device,
+                dtype=torch.long,
+            )
+
+            if show_log:
+                self.print_to_log_file(
+                    f"Phase 2/2 — Train-mode warmup (2 steps, batch={batch_size}, "
+                    f"AMP={self.autocast_dtype}) ..."
+                )
+
+            for _ in tqdm(range(2), desc="Train warmup", unit="step", **pbar_kw):
+                self.optimizer.zero_grad(set_to_none=True)
+                with autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.device.type == 'cuda'):
+                    output = self.network(dummy_batch)
+                    l = self.loss(output, dummy_target)
+                if self.grad_scaler is not None:
+                    self.grad_scaler.scale(l).backward()
+                    self.grad_scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    l.backward()
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                    self.optimizer.step()
 
         if show_log:
             self.print_to_log_file("Kernel warmup complete.")
@@ -630,13 +682,109 @@ class nnUNetTrainer(object):
         if self.local_rank == 0:
             dct = deepcopy(self.plans_manager.plans)
             del dct['configurations']
+            # 实际使用的配置：batch_size 以训练器实际值为准（DDP 下为每 GPU 值），
+            # architecture 替换为实际构建的网络结构。plan.json 中的 architecture 是
+            # nnU-Net 规划器写入的默认模板（PlainConvUNet 等），本项目各模型
+            # （LightMamba2Net / UMamba / UNETR ...）均在训练器内自行构建网络，
+            # 超参数由模型定义，与 plan 模板无关，故直接打印模型真实结构。
+            config = deepcopy(self.configuration_manager.configuration)
+            config['batch_size'] = self.batch_size
+            config['architecture'] = self._actual_architecture_summary()
+            # 附加训练上下文: 数据集 / 损失 / 优化器 / AMP 精度
+            config['dataset'] = self._dataset_summary()
+            config['training'] = {
+                'loss': self.loss.__class__.__name__ if self.loss is not None else None,
+                'optimizer': self.optimizer.__class__.__name__ if self.optimizer is not None else None,
+                'lr_scheduler': self.lr_scheduler.__class__.__name__ if self.lr_scheduler is not None else None,
+                'initial_lr': getattr(self, 'initial_lr', None),
+                'autocast_dtype': str(getattr(self, 'autocast_dtype', 'n/a')),
+            }
             self.print_to_log_file(f"\nThis is the configuration used by this "
                                    f"training:\n"
                                    f"Trainer: {self.__class__.__name__}\n"
                                    f"NumEpochs: {self.num_epochs}\n"
                                    f"Configuration name: {self.configuration_name}\n",
-                                   self.configuration_manager, '\n', add_timestamp=False)
+                                   config, '\n', add_timestamp=False)
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
+
+    def _dataset_summary(self) -> dict:
+        """提取当前训练数据集信息（名称 / 标签 / 样本数 / 通道 / 文件后缀）。
+
+        dataset_name 位于 plans.json 全局设置中；标签等其余字段来自 dataset.json。
+        """
+        dj = self.dataset_json or {}
+        labels = dj.get('labels')
+        # 反向映射 {name: id} -> {id: name}，便于阅读
+        if isinstance(labels, dict) and labels and all(isinstance(v, int) for v in labels.values()):
+            labels = {str(v): k for k, v in labels.items()}
+        channels = dj.get('channel_names')
+        return {
+            'name': self.plans_manager.plans.get('dataset_name'),
+            'num_training': dj.get('numTraining'),
+            'labels': labels,
+            'channels': list(channels.values()) if isinstance(channels, dict) else channels,
+            'file_ending': dj.get('file_ending'),
+        }
+
+    def _actual_architecture_summary(self) -> dict:
+        """从已构建的网络实例提取真实结构摘要（类名 + 构造参数 + 可训练参数量）。
+
+        通过 inspect 反射网络 __init__ 签名，并用实例属性 / 训练器属性回填实际值，
+        对任意自定义网络（LightMamba2Net / UMamba / UNETR / PlainConvUNet ...）通用。
+        在 print_plans 被调用时（on_train_start）self.network 已构建完成。
+        """
+        if self.network is None:
+            return {'network_class': 'not_built_yet', 'params': {}}
+        net = self.network
+        # 解包 DDP / torch.compile 包装层，拿到原始模型
+        if isinstance(net, DDP):
+            net = net.module
+        if isinstance(net, OptimizedModule):
+            net = net._orig_mod
+
+        summary = {
+            'network_class': f"{net.__class__.__module__}.{net.__class__.__name__}",
+            'params': {},
+            'trainable_params': int(sum(p.numel() for p in net.parameters() if p.requires_grad)),
+        }
+        # 统计网络中的激活函数与归一化层类型及数量。
+        # 自定义网络（LightMamba2Net 等）内部结构各异，按标准层类型遍历统计即可。
+        act_stats, norm_stats = {}, {}
+        for mod in net.modules():
+            if isinstance(mod, (nn.ReLU, nn.GELU, nn.SiLU, nn.LeakyReLU, nn.PReLU,
+                                nn.Sigmoid, nn.Tanh, nn.Softmax, nn.Mish, nn.ELU, nn.Hardswish)):
+                name = mod.__class__.__name__
+                act_stats[name] = act_stats.get(name, 0) + 1
+            elif isinstance(mod, (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d,
+                                  nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+                                  nn.LayerNorm, nn.GroupNorm)):
+                name = mod.__class__.__name__
+                norm_stats[name] = norm_stats.get(name, 0) + 1
+        summary['activations'] = act_stats
+        summary['normalizations'] = norm_stats
+        try:
+            sig = inspect.signature(net.__class__.__init__)
+            for name, param in sig.parameters.items():
+                if name in ('self', 'args', 'kwargs'):
+                    continue
+                attr = getattr(net, name, None)
+                # 输入/输出通道数常未存为实例属性，用训练器实际值回填
+                if attr is None and name in ('in_ch', 'in_channels', 'num_input_channels'):
+                    attr = getattr(self, 'num_input_channels', None)
+                if attr is None and name in ('out_ch', 'out_channels', 'num_output_channels'):
+                    attr = getattr(self, 'num_output_channels', None)
+                if attr is not None and not isinstance(attr, (nn.Module, nn.Parameter)) \
+                        and isinstance(attr, (int, float, str, bool, list, tuple, dict, type(None))):
+                    summary['params'][name] = attr
+                    continue
+                # 实例无该属性时回退到签名默认值
+                if param.default is not inspect.Parameter.empty:
+                    summary['params'][name] = param.default
+                else:
+                    summary['params'][name] = '<required>'
+        except (TypeError, ValueError):
+            pass
+        return summary
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
