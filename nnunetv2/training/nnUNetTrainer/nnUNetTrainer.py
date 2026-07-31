@@ -1261,7 +1261,14 @@ class nnUNetTrainer(object):
         # helper: compute delta from previous epoch (None if first epoch)
         def _delta(key):
             try:
-                return self.logger.get_value(key, step=-1) - self.logger.get_value(key, step=-2)
+                v_now = self.logger.get_value(key, step=-1)
+                v_prev = self.logger.get_value(key, step=-2)
+                # handle list/array per-class metrics (element-wise subtraction)
+                if isinstance(v_now, (list, tuple, np.ndarray)):
+                    if isinstance(v_now, np.ndarray):
+                        return list(v_now - np.asarray(v_prev))
+                    return [a - b for a, b in zip(v_now, v_prev)]
+                return v_now - v_prev
             except (IndexError, TypeError):
                 return None
 
@@ -1300,9 +1307,17 @@ class nnUNetTrainer(object):
             val_str = ', '.join(f'{v:.4f}' for v in raw)
             delta = _delta(key)
             if delta is not None:
-                delta_str = ', '.join(f'{d:+.4f}' for d in delta)
-                arrow_str = ', '.join(_arrow(d, True) for d in delta)
-                self.print_to_log_file(f'{label:<{width}} [{val_str}]   (Δ [{delta_str}]) [{arrow_str}]')
+                if len(delta) == 1:
+                    # single class: compact format without brackets
+                    d = delta[0]
+                    self.print_to_log_file(
+                        f'{label:<{width}} [{val_str}]   (Δ {d:+.4f}) {_arrow(d, True)}')
+                else:
+                    # multiple classes: list format with brackets
+                    delta_str = ', '.join(f'{d:+.4f}' for d in delta)
+                    arrow_str = ', '.join(_arrow(d, True) for d in delta)
+                    self.print_to_log_file(
+                        f'{label:<{width}} [{val_str}]   (Δ [{delta_str}]) [{arrow_str}]')
             else:
                 self.print_to_log_file(f'{label:<{width}} [{val_str}]')
 

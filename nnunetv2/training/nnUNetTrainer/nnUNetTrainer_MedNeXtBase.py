@@ -114,6 +114,7 @@ class nnUNetTrainer_MedNeXtBase(nnUNetTrainer):
     def on_epoch_end(self):
         """
         在父类默认 epoch 结束处理之后，打印 MedNeXt 增强指标。
+        全零时跳过（模型尚未学到有效前景预测），非全零时附带 Δ 变化量和箭头指示。
         """
         # 先调用父类处理官方默认行为
         super().on_epoch_end()
@@ -125,8 +126,24 @@ class nnUNetTrainer_MedNeXtBase(nnUNetTrainer):
             recall = self.logger.get_value('recall', step=-1)
             dice_ignore_fn = self.logger.get_value('dice_ignore_fn', step=-1)
             std_dice = self.logger.get_value('std_dice', step=-1)
+
+            # 全零则跳过：模型尚未学到有效前景预测，输出无意义
+            if precision == 0.0 and recall == 0.0 and dice_ignore_fn == 0.0 and std_dice == 0.0:
+                return
+
+            # 计算 Δ 变化量（higher is better）
+            if len(precision_list) >= 2:
+                p_delta = precision_list[-1] - precision_list[-2]
+                if abs(p_delta) < 1e-8:
+                    p_arrow = '→'
+                else:
+                    p_arrow = '↑' if p_delta > 0 else '↓'
+                p_str = f'(Δ {p_delta:+.4f}) {p_arrow}'
+            else:
+                p_str = ''
+
             self.print_to_log_file(
-                f'Precision: {np.round(precision, decimals=4)}, '
+                f'  Precision: {np.round(precision, decimals=4)} {p_str}, '
                 f'Recall: {np.round(recall, decimals=4)}, '
                 f'Dice_Ignore_FN: {np.round(dice_ignore_fn, decimals=4)}, '
                 f'Std_Dice: {np.round(std_dice, decimals=4)}'
