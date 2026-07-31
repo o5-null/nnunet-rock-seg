@@ -1465,54 +1465,57 @@ class nnUNetTrainer(object):
                 _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
 
             results = []
-            num_val_workers = max(2, min(8, int(os.environ.get('nnUNet_n_proc_DA', '4'))))
-
             disable_tqdm = self.local_rank != 0
             _val_keys = list(dataset_val.identifiers)
 
-            # 多线程验证：并行加载数据 + 并行 GPU 推理（per-thread CUDA stream）
+            # 数据预取线程 + 主线程 GPU 推理，解耦 I/O 与计算
+            # 预取线程负责数据加载（numpy I/O 在 C 层释放 GIL）
+            # 主线程专做 GPU 推理（CUDA kernel 释放 GIL），两者可重叠
+            import queue as _queue
             import threading
-            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            # 每个线程使用独立的 CUDA stream 实现 GPU 推理并行化
-            # 纯推理（inference_mode）下同模型并行 forward 是安全的
-            _thread_streams = threading.local()
+            _prefetch_queue = _queue.Queue(maxsize=4)
+            _prefetch_done = threading.Event()
 
-            def _val_worker(k):
-                """单张验证：加载、预处理、GPU 推理（per-thread CUDA stream）"""
-                data, _, seg_prev, properties = dataset_val.load_case(k)
-                data = data[:]
-                if self.is_cascaded:
-                    seg_prev = seg_prev[:]
-                    data = np.vstack((data, convert_labelmap_to_one_hot(
-                        seg_prev, self.label_manager.foreground_labels, output_dtype=data.dtype)))
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    data = torch.from_numpy(data)
-                if self.device.type == 'cuda':
-                    if not hasattr(_thread_streams, 'stream'):
-                        _thread_streams.stream = torch.cuda.Stream(device=self.device)
-                    with torch.cuda.stream(_thread_streams.stream):
-                        prediction = predictor.predict_sliding_window_return_logits(data)
-                else:
-                    prediction = predictor.predict_sliding_window_return_logits(data)
-                return k, prediction.cpu(), properties
+            def _prefetch_worker():
+                """后台线程：专责数据加载，预取到队列"""
+                for k in _val_keys:
+                    if _prefetch_done.is_set():
+                        return
+                    data, _, seg_prev, properties = dataset_val.load_case(k)
+                    data = data[:]
+                    if self.is_cascaded:
+                        seg_prev = seg_prev[:]
+                        data = np.vstack((data, convert_labelmap_to_one_hot(
+                            seg_prev, self.label_manager.foreground_labels, output_dtype=data.dtype)))
+                    _prefetch_queue.put((k, data, properties))
+                _prefetch_queue.put(None)  # 哨兵
 
-            with ThreadPoolExecutor(max_workers=num_val_workers) as executor:
-                futures = {executor.submit(_val_worker, k): k for k in _val_keys}
-                with tqdm(total=len(_val_keys), desc="Val", unit="img",
-                          disable=disable_tqdm) as pbar:
-                    for i, future in enumerate(as_completed(futures)):
-                        k, prediction, properties = future.result()
+            prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
+            prefetch_thread.start()
+
+            # GPU 批量推理：积累 BATCH_SIZE 张图后一次 forward，提升 GPU 利用率
+            val_batch_size = int(os.environ.get('nnUNet_val_batch_size', '4'))
+            from acvl_utils.cropping_and_padding.padding import pad_nd_image as _pad_batch
+
+            with tqdm(total=len(_val_keys), desc="Val", unit="img",
+                      disable=disable_tqdm) as pbar:
+                i = 0
+                batch_items = []  # [(k, data, properties), ...]
+
+                def _submit_batch(items_with_preds):
+                    """为一批已完成推理的结果提交 export + 处理 next_stage + DDP barrier"""
+                    nonlocal i
+                    for (k, _, properties), prediction in items_with_preds:
                         pbar.set_postfix_str(k)
 
                         # export backpressure
                         proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list,
-                                                                   results, allowed_num_queued=2)
+                                                                    results, allowed_num_queued=2)
                         while not proceed:
                             sleep(0.1)
                             proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list,
-                                                                       results, allowed_num_queued=2)
+                                                                        results, allowed_num_queued=2)
 
                         output_filename_truncated = join(validation_output_folder, k)
 
@@ -1531,8 +1534,8 @@ class nnUNetTrainer(object):
                             for n in next_stages:
                                 next_stage_config_manager = self.plans_manager.get_configuration(n)
                                 expected_preprocessed_folder = join(nnUNet_preprocessed,
-                                                                    self.plans_manager.dataset_name,
-                                                                    next_stage_config_manager.data_identifier)
+                                                                     self.plans_manager.dataset_name,
+                                                                     next_stage_config_manager.data_identifier)
                                 dataset_class = infer_dataset_class(expected_preprocessed_folder)
 
                                 try:
@@ -1564,8 +1567,38 @@ class nnUNetTrainer(object):
                         if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
                             dist.barrier()
 
+                        i += 1
                         pbar.update()
 
+                while True:
+                    item = _prefetch_queue.get()
+                    if item is None:
+                        break
+                    k, data, properties = item
+                    batch_items.append((k, data, properties))
+
+                    if len(batch_items) >= val_batch_size:
+                        # 批量 GPU 推理：先各自 pad 到 patch_size 保证同 shape，再 stack
+                        _ps = self.configuration_manager.patch_size
+                        batch_padded = [_pad_batch(d, _ps, 'constant', {'constant_values': 0}, True, None)[0]
+                                        for _, d, _ in batch_items]
+                        batch_tensor = torch.from_numpy(np.stack(batch_padded, axis=0))
+                        predictions = predictor.predict_batch_return_logits(batch_tensor)
+
+                        _submit_batch(zip(batch_items, [predictions[j] for j in range(len(batch_items))]))
+                        batch_items = []
+
+                # 处理剩余不足一批的图
+                if batch_items:
+                    _ps = self.configuration_manager.patch_size
+                    batch_padded = [_pad_batch(d, _ps, 'constant', {'constant_values': 0}, True, None)[0]
+                                    for _, d, _ in batch_items]
+                    batch_tensor = torch.from_numpy(np.stack(batch_padded, axis=0))
+                    predictions = predictor.predict_batch_return_logits(batch_tensor)
+                    _submit_batch(zip(batch_items, [predictions[j] for j in range(len(batch_items))]))
+                    batch_items = []
+
+            _prefetch_done.set()  # 确保预取线程退出
             _ = [r.get() for r in results]
 
         if self.is_ddp:

@@ -770,6 +770,111 @@ class nnUNetPredictor(object):
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
 
+    @torch.inference_mode()
+    def predict_batch_return_logits(self, batch: torch.Tensor) -> torch.Tensor:
+        """
+        批量图像推理：将多张图像 stack 为 batch 一次 forward，大幅提升 GPU 利用率。
+
+        保持 nnUNet 原生数据格式：
+          - 2D: 输入 (B, C, 1, H, W)，输出 (B, num_classes, 1, H, W)
+          - 3D: 输入 (B, C, H, W, D)，输出 (B, num_classes, H, W, D)
+
+        Args:
+            batch: (B, C, [1,] H, W) CPU tensor
+
+        Returns:
+            (B, num_classes, [1,] H, W) CPU tensor
+        """
+        ndim = batch.ndim
+        assert ndim in (4, 5), f'Expected 4D/5D batch, got shape={batch.shape}'
+        B = batch.shape[0]
+        if B == 0:
+            return batch.new_empty(0)
+
+        self.network = self.network.to(self.device)
+        self.network.eval()
+        empty_cache(self.device)
+
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            # 1) pad 到 patch_size（保持 nnUNet 原生 spatial dims）
+            data, slicer_revert_padding = pad_nd_image(
+                batch, self.configuration_manager.patch_size,
+                'constant', {'value': 0}, True, None
+            )
+
+            # 2) 用 spatial shape (去掉 batch+channel 维) 获取 slicers
+            #    2D: data.shape[2:] = (1, H', W') → slicers 含 depth 维
+            #    3D: data.shape[2:] = (H', W', D')
+            slicers = self._internal_get_sliding_window_slicers(data.shape[2:])
+
+            try:
+                data_gpu = data.to(self.device, non_blocking=True)
+
+                # 3) 预分配累加器（基于单图 spatial shape，带 batch 维）
+                single_spatial = data.shape[2:]  # (1, H', W') 或 (H', W', D')
+                predicted_logits = torch.zeros(
+                    (B, self.label_manager.num_segmentation_heads, *single_spatial),
+                    dtype=torch.float16, device=self.device
+                )
+                n_predictions = torch.zeros(
+                    (B, *single_spatial), dtype=torch.float16, device=self.device
+                )
+
+                if self.use_gaussian:
+                    gaussian = compute_gaussian(
+                        tuple(self.configuration_manager.patch_size),
+                        sigma_scale=1. / 8, value_scaling_factor=10,
+                        device=self.device
+                    )
+                else:
+                    gaussian = 1
+
+                # 4) 批量 sliding window
+                #    slicers 是单-image 的（无 batch 维），对 batch 需要补 (slice(None), ...)
+                for sl in slicers:
+                    # sl 格式举例:
+                    #   2D: (slice(None), 0, slice(y1,y2), slice(x1,x2))
+                    #   3D: (slice(None), slice(z1,z2), slice(y1,y2), slice(x1,x2))
+                    batch_sl = (slice(None), *sl)  # 补 batch 维
+
+                    patches = data_gpu[batch_sl]  # (B, C, ...) or (B, C, 1, PH, PW)
+
+                    # 5) 批量 forward + mirror TTA
+                    #    _internal_maybe_mirror_and_predict 对 spatial dims 做 flip，
+                    #    含 depth 维时 mirror_axes+2 后正确索引 4D/5D tensor
+                    pred = self._internal_maybe_mirror_and_predict(patches)
+                    if isinstance(pred, (tuple, list)):
+                        pred = pred[0]
+
+                    if self.use_gaussian:
+                        pred *= gaussian
+
+                    # 累加到对应位置
+                    predicted_logits[batch_sl] += pred
+                    # n_predictions: (B, 1, H', W') 或 (B, H', W', D')
+                    n_sl = (slice(None), *sl[1:])  # 去掉 channel 维
+                    n_predictions[n_sl] += gaussian
+
+                # 6) 归一化
+                torch.div(predicted_logits, n_predictions.unsqueeze(1), out=predicted_logits)
+
+                if torch.any(torch.isinf(predicted_logits)):
+                    raise RuntimeError('Encountered inf in predicted array.')
+
+                # 7) 去掉 padding
+                #    slicer_revert_padding 基于 (B, C, ...) 维，需跳过 batch+channel
+                predicted_logits = predicted_logits[
+                    (slice(None), slice(None), *slicer_revert_padding[2:])
+                ]
+                return predicted_logits.cpu()
+
+            except Exception as e:
+                del predicted_logits, n_predictions, data_gpu
+                empty_cache(self.device)
+                raise e
+            finally:
+                empty_cache(self.device)
+
     def predict_from_files_sequential(self,
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],
                            output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
