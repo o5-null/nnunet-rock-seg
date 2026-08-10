@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import socket
+import sys
 from typing import Union, Optional
 
 # === Default environment optimizations for RTX 3080 (Ampere) ===
@@ -104,8 +105,53 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 
+def shutdown_trainer_resources(nnunet_trainer):
+    """主动关闭 trainer 的后台资源（数据加载器进程）。
+
+    在 KeyboardInterrupt 中断路径调用，防止解释器关闭阶段 batchgenerators
+    的 __del__ 访问已被系统关闭的 multiprocessing 句柄，打印
+    "Exception ignored ... OSError: [WinError 6] 句柄无效" 等丑陋 traceback。
+    与 on_train_end() 中的关闭逻辑一致，静默执行。
+    """
+    if nnunet_trainer is None:
+        return
+    try:
+        from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+        from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
+
+        old_stdout = sys.stdout
+        with open(os.devnull, 'w') as f:
+            sys.stdout = f
+            try:
+                for dl in (getattr(nnunet_trainer, 'dataloader_train', None),
+                           getattr(nnunet_trainer, 'dataloader_val', None)):
+                    if dl is not None and isinstance(dl, (NonDetMultiThreadedAugmenter, MultiThreadedAugmenter)):
+                        # 非 force 模式：先暂停生产者再排空队列，workers 可干净退出
+                        dl._finish(timeout=5)
+            finally:
+                sys.stdout = old_stdout
+    except Exception:
+        # 清理是尽力而为，任何失败都不能阻塞退出
+        pass
+
+
+def exit_on_interrupt(msg: str, code: int = 130):
+    """打印中断提示后立即终止进程（跳过解释器关闭阶段）。
+
+    sys.exit() 会触发解释器 shutdown，此时所有对象的 __del__ 仍会被调用，
+    batchgenerators 的析构函数访问已失效的 multiprocessing 句柄会再次打印
+    OSError traceback。os._exit() 直接终止进程，彻底杜绝该类噪音。
+    code 默认 130 = 128 + SIGINT(2)，符合"被 Ctrl+C 中断"的惯例。
+    """
+    print(msg)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size, num_epochs=None):
+            pretrained_weights, npz, val_with_best, world_size, num_epochs=None, probe_mode='auto',
+            profile_config=None):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -115,6 +161,16 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     # 必须在 run_training() 调用前设置，确保 LR scheduler 与训练循环都使用新值
     if num_epochs is not None:
         nnunet_trainer.num_epochs = num_epochs
+
+    # 命令行 -profile 覆盖环境变量 nnUNet_profile（None 时保留 trainer 内读取的环境变量值）
+    if profile_config is not None:
+        nnunet_trainer.profile_config = profile_config
+
+    # 命令行 --probe 控制探测缓存模式（auto/force/only）
+    if hasattr(nnunet_trainer, 'probe_cache_mode'):
+        nnunet_trainer.probe_cache_mode = probe_mode
+        if probe_mode == 'only':
+            nnunet_trainer.probe_only = True
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -127,13 +183,18 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
         cudnn.deterministic = False
         cudnn.benchmark = True
 
-    if not val:
-        nnunet_trainer.run_training()
+    try:
+        if not val:
+            nnunet_trainer.run_training()
 
-    if val_with_best:
-        nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
-    nnunet_trainer.perform_actual_validation(npz)
-    cleanup_ddp()
+        if val_with_best:
+            nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
+        nnunet_trainer.perform_actual_validation(npz)
+    except KeyboardInterrupt:
+        shutdown_trainer_resources(nnunet_trainer)
+        exit_on_interrupt(f"[DDP rank {rank}] 训练被用户中断 (Ctrl+C)，后台数据加载器已关闭，进程已干净退出。")
+    finally:
+        cleanup_ddp()
 
 
 def run_training(dataset_name_or_id: Union[str, int],
@@ -148,7 +209,9 @@ def run_training(dataset_name_or_id: Union[str, int],
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
                  num_epochs: Optional[int] = None,
-                  device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'),
+                 probe_mode: str = 'auto',
+                 profile_config: Optional[str] = None):
     # Enable TF32 on Ampere+ GPUs for ~1.5x matmul speedup
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -192,7 +255,9 @@ def run_training(dataset_name_or_id: Union[str, int],
                      export_validation_probabilities,
                      val_with_best,
                      num_gpus,
-                     num_epochs),
+                     num_epochs,
+                     probe_mode,
+                     profile_config),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -205,8 +270,18 @@ def run_training(dataset_name_or_id: Union[str, int],
         if num_epochs is not None:
             nnunet_trainer.num_epochs = num_epochs
 
+        # 命令行 -profile 覆盖环境变量 nnUNet_profile（None 时保留 trainer 内读取的环境变量值）
+        if profile_config is not None:
+            nnunet_trainer.profile_config = profile_config
+
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
+
+        # 命令行 --probe 控制探测缓存模式（auto/force/only）
+        if hasattr(nnunet_trainer, 'probe_cache_mode'):
+            nnunet_trainer.probe_cache_mode = probe_mode
+            if probe_mode == 'only':
+                nnunet_trainer.probe_only = True
 
         assert not (continue_training and only_run_validation), 'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -216,12 +291,16 @@ def run_training(dataset_name_or_id: Union[str, int],
             cudnn.deterministic = False
             cudnn.benchmark = True
 
-        if not only_run_validation:
-            nnunet_trainer.run_training()
+        try:
+            if not only_run_validation:
+                nnunet_trainer.run_training()
 
-        if val_with_best:
-            nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
-        nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+            if val_with_best:
+                nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
+            nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+        except KeyboardInterrupt:
+            shutdown_trainer_resources(nnunet_trainer)
+            exit_on_interrupt("训练被用户中断 (Ctrl+C)，后台数据加载器已关闭，进程已干净退出。")
 
 
 def run_training_entry():
@@ -265,6 +344,17 @@ def run_training_entry():
                         help='[OPTIONAL] 覆盖 trainer 的训练 epoch 数。不传则使用 trainer 类自带默认值 '
                              '(nnUNetTrainer 默认 1000，变体如 nnUNetTrainer_100epochs 带 100)。'
                              '显式传入会覆盖变体类设置，例如 -tr nnUNetTrainer_100epochs -epoch 50 实际跑 50 epoch。')
+    parser.add_argument('--probe', type=str, default='auto', required=False,
+                        choices=['auto', 'force', 'only'],
+                        help='[OPTIONAL] batch 探测缓存模式 (nnUNetTrainerBatchProbe 系列): '
+                             'auto=环境未变则用缓存(默认), force=忽略缓存强制重新探测, '
+                             'only=只探测不训练(结果写缓存后退出)')
+    parser.add_argument('-profile', type=str, default=None, required=False,
+                        help='[OPTIONAL] 启用 torch.profiler 性能分析。格式: '
+                             '"auto"=默认采样窗口(wait=5, warmup=2, active=3), '
+                             '或 "wait,warmup,active" 自定义如 "5,2,3"。'
+                             'trace 导出到 output_folder/profile/。'
+                             '优先级高于环境变量 nnUNet_profile。')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -280,9 +370,14 @@ def run_training_entry():
     else:
         device = torch.device('mps')
 
-    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
-                 args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 num_epochs=args.epoch, device=device)
+    try:
+        run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
+                     args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
+                     num_epochs=args.epoch, device=device, probe_mode=args.probe, profile_config=args.profile)
+    except KeyboardInterrupt:
+        # 兜底：正常情况下 KeyboardInterrupt 已在 run_training() 内部处理，
+        # 此处覆盖 trainer 尚未创建（如 argparse/环境准备阶段）就中断的场景。
+        exit_on_interrupt("训练被用户中断 (Ctrl+C)，进程已干净退出。")
 
 
 if __name__ == '__main__':

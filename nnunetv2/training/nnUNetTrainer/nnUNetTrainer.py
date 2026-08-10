@@ -202,6 +202,11 @@ class nnUNetTrainer(object):
         self.save_every = 50
         self.disable_checkpointing = False
 
+        ### torch.profiler 性能分析配置
+        # 环境变量 nnUNet_profile 提供默认值，命令行 -profile 优先级更高（run_training.py 中覆盖）
+        # 取值: None/空=禁用; 'auto'=默认窗口(wait=5, warmup=2, active=3); 'wait,warmup,active'=自定义
+        self.profile_config = os.environ.get('nnUNet_profile', None)
+
         self.was_initialized = False
 
         self.print_to_log_file("\n#######################################################################\n"
@@ -360,7 +365,9 @@ class nnUNetTrainer(object):
         else:
             with torch.no_grad():
                 dummy_out = self.network(dummy)
-            # DS 模式下部分网络 (SwinUMambaD/M2Net 等) 返回 list[seg...]，取主输出(全分辨率)即可
+            # DS 模式下部分网络 (SwinUMambaD/M2Net 等) 返回 list[seg...]，取主输出(全分辨率)即可，
+            # 但需先保留各分辨率输出 shape，用于生成与 loss 匹配的多分辨率 dummy target
+            ds_output_shapes = [o.shape for o in dummy_out] if isinstance(dummy_out, (list, tuple)) else None
             if isinstance(dummy_out, (list, tuple)):
                 dummy_out = dummy_out[0]
             num_output_channels = dummy_out.shape[1]
@@ -370,12 +377,21 @@ class nnUNetTrainer(object):
                 (batch_size, self.num_input_channels, *self.configuration_manager.patch_size),
                 device=self.device,
             )
-            dummy_target = torch.randint(
-                0, max(1, num_output_channels),
-                (batch_size, 1, *self.configuration_manager.patch_size),
-                device=self.device,
-                dtype=torch.long,
-            )
+            if ds_output_shapes is not None:
+                # DS 模式: DeepSupervisionWrapper 要求所有参数均为 list/tuple，故按每个
+                # 输出分辨率各生成一个 dummy target（dummy_out 的 batch=1，此处用 batch_size）
+                dummy_target = [
+                    torch.randint(0, max(1, num_output_channels), (batch_size, *s[1:]),
+                                  device=self.device, dtype=torch.long)
+                    for s in ds_output_shapes
+                ]
+            else:
+                dummy_target = torch.randint(
+                    0, max(1, num_output_channels),
+                    (batch_size, 1, *self.configuration_manager.patch_size),
+                    device=self.device,
+                    dtype=torch.long,
+                )
 
             if show_log:
                 self.print_to_log_file(
@@ -786,6 +802,104 @@ class nnUNetTrainer(object):
             pass
         return summary
 
+    # ------------------------------------------------------------------
+    # GPU 监控: 训练过程中收集显卡利用率 / 功耗 / 显存数据
+    # ------------------------------------------------------------------
+    def _init_gpu_monitor(self):
+        """初始化 NVML GPU 监控；失败则降级为仅 torch.cuda 显存统计。
+
+        NVML（nvidia-ml-py）用于读取 GPU 利用率与功耗，torch.cuda 提供进程
+        显存占用。在 on_train_start 中调用，此时 CUDA 已就绪。
+        """
+        self._gpu_nvml = None
+        self._gpu_handle = None
+        self._gpu_agg = {}
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._gpu_nvml = pynvml
+            # DDP 时 local_rank 即当前进程绑定的 GPU 索引；非 DDP 单卡为 0
+            self._gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(self.local_rank)
+            if self.local_rank == 0:
+                self.print_to_log_file(
+                    f"[GPU monitor] NVML ready: {pynvml.nvmlDeviceGetName(self._gpu_handle)}")
+        except Exception as e:
+            self._gpu_nvml = None
+            self._gpu_handle = None
+            if self.local_rank == 0:
+                self.print_to_log_file(
+                    f"[GPU monitor] NVML unavailable ({e}), falling back to torch.cuda memory only")
+
+    def _sample_gpu_stats(self) -> dict:
+        """采样一次 GPU 状态。
+
+        NVML 可用时返回: gpu_util_percent / gpu_power_w / gpu_mem_used_mb
+        始终返回:      mem_alloc_mb / mem_reserved_mb（进程侧，torch.cuda）
+        单项失败时跳过该项（部分 GPU 不支持功耗查询）。
+        """
+        stats = {}
+        if self._gpu_nvml is not None and self._gpu_handle is not None:
+            try:
+                util = self._gpu_nvml.nvmlDeviceGetUtilizationRates(self._gpu_handle)
+                stats['gpu_util_percent'] = float(util.gpu)
+            except Exception:
+                pass
+            try:
+                stats['gpu_power_w'] = self._gpu_nvml.nvmlDeviceGetPowerUsage(self._gpu_handle) / 1000.0
+            except Exception:
+                pass
+            try:
+                stats['gpu_mem_used_mb'] = self._gpu_nvml.nvmlDeviceGetMemoryInfo(self._gpu_handle).used / 1024 ** 2
+            except Exception:
+                pass
+        if torch.cuda.is_available():
+            try:
+                stats['mem_alloc_mb'] = torch.cuda.memory_allocated(self.device) / 1024 ** 2
+                stats['mem_reserved_mb'] = torch.cuda.memory_reserved(self.device) / 1024 ** 2
+            except Exception:
+                pass
+        return stats
+
+    def _accumulate_gpu_stats(self, stats: dict):
+        """将一次采样累积到聚合器（均值 + 峰值），不保存逐条样本，零内存增长。"""
+        agg = self._gpu_agg
+        agg['count'] = agg.get('count', 0) + 1
+        for k, v in stats.items():
+            agg[f'{k}_sum'] = agg.get(f'{k}_sum', 0.0) + v
+            agg[f'{k}_max'] = max(agg.get(f'{k}_max', 0.0), v)
+
+    def _print_gpu_summary(self):
+        """打印本 epoch 的 GPU 统计汇总（均值 / 峰值），仅 rank 0。"""
+        if self.local_rank != 0:
+            return
+        agg = self._gpu_agg
+        n = agg.get('count', 0)
+        if n == 0:
+            return
+
+        def _avg(key):
+            s = agg.get(f'{key}_sum')
+            return s / n if s is not None else None
+
+        parts = []
+        util = _avg('gpu_util_percent')
+        if util is not None:
+            parts.append(f'util {util:5.1f}% (max {agg[f"gpu_util_percent_max"]:5.1f}%)')
+        power = _avg('gpu_power_w')
+        if power is not None:
+            parts.append(f'power {power:6.1f}W (max {agg[f"gpu_power_w_max"]:6.1f}W)')
+        mem = _avg('gpu_mem_used_mb')
+        if mem is not None:
+            parts.append(f'gpu_mem {mem:7.0f}MB (max {agg[f"gpu_mem_used_mb_max"]:7.0f}MB)')
+        alloc = _avg('mem_alloc_mb')
+        if alloc is not None:
+            parts.append(f'proc_alloc {alloc:6.0f}MB (max {agg["mem_alloc_mb_max"]:6.0f}MB)')
+        reserved = _avg('mem_reserved_mb')
+        if reserved is not None:
+            parts.append(f'proc_resv {reserved:6.0f}MB (max {agg["mem_reserved_mb_max"]:6.0f}MB)')
+        if parts:
+            self.print_to_log_file('GPU           ' + ', '.join(parts))
+
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
@@ -1167,6 +1281,9 @@ class nnUNetTrainer(object):
         # make sure deep supervision is on in the network
         self.set_deep_supervision_enabled(self.enable_deep_supervision)
 
+        # 初始化 GPU 监控（利用率/功耗/显存），NVML 不可用时自动降级
+        self._init_gpu_monitor()
+
         self.print_plans()
         empty_cache(self.device)
 
@@ -1226,6 +1343,8 @@ class nnUNetTrainer(object):
 
     def on_train_epoch_start(self):
         self.network.train()
+        # 重置本 epoch 的 GPU 监控聚合器（每个 epoch 独立统计）
+        self._gpu_agg = {'count': 0}
         # PolyLRScheduler 是闭式形式，lr 直接由 current_epoch 计算，不依赖 optimizer.step 计数。
         # 但 PyTorch 会对 "step() 先于 optimizer.step()" 与显式 epoch 参数发出无害 UserWarning，
         # 每 epoch 刷屏，此处静默之。
@@ -1505,6 +1624,9 @@ class nnUNetTrainer(object):
         epoch_time = self.logger.get_value('epoch_end_timestamps', step=-1) - \
                      self.logger.get_value('epoch_start_timestamps', step=-1)
         self.print_to_log_file(f'Epoch time    {epoch_time:.2f} s')
+
+        # GPU 利用率 / 功耗 / 显存汇总（本 epoch 训练阶段的均值与峰值）
+        self._print_gpu_summary()
 
         # handling periodic checkpointing
         current_epoch = self.current_epoch
@@ -1795,37 +1917,155 @@ class nnUNetTrainer(object):
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
 
+    @staticmethod
+    def _parse_profile_schedule(cfg) -> Tuple[int, int, int]:
+        """解析 profile 配置字符串为 (wait, warmup, active) 采样窗口。
+
+        支持格式:
+        - 'auto' / 'true' / '1' / 'on' / 'yes' → 默认 (5, 2, 3)
+        - 'wait,warmup,active' 如 '5,2,3' → 自定义窗口
+        - '' / '0' / 'false' / 'off' / 'no' → 返回 None（禁用）
+
+        schedule 语义: 前 wait 步不采样(冷启动), warmup 步预热(丢弃统计), active 步实际记录。
+        """
+        s = str(cfg).strip().lower()
+        if s in ('', '0', 'false', 'off', 'no', 'none'):
+            return None
+        if s in ('auto', '1', 'true', 'on', 'yes'):
+            return (5, 2, 3)
+        parts = s.split(',')
+        if len(parts) == 3:
+            try:
+                w, wu, a = (int(p) for p in parts)
+                if w >= 0 and wu >= 0 and a > 0:
+                    return (w, wu, a)
+            except ValueError:
+                pass
+        raise ValueError(f"无法解析 profile 配置 '{cfg}'。支持格式: auto 或 wait,warmup,active (如 5,2,3)")
+
+    def _maybe_start_profiler(self):
+        """根据 profile_config 启动 torch.profiler，返回 profiler 实例或 None（未启用）。
+
+        - 非 CUDA 设备跳过（profiler 的 CUDA activity 需要 CUDA）
+        - trace 输出到 output_folder/profile/，DDP 下每 rank 独立导出
+        - schedule repeat=1: 仅在第一个 epoch 内采样一次窗口，之后开销近零
+        """
+        if self.profile_config is None:
+            return None
+        schedule_cfg = self._parse_profile_schedule(self.profile_config)
+        if schedule_cfg is None:
+            return None
+        if self.device.type != 'cuda':
+            self.print_to_log_file("WARNING: torch.profiler 仅支持 CUDA 设备，跳过性能分析")
+            return None
+        wait, warmup, active = schedule_cfg
+        profile_dir = join(self.output_folder, 'profile')
+        maybe_mkdir_p(profile_dir)
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
+            on_trace_ready=self._profile_trace_handler,
+            record_shapes=True,
+            profile_memory=False,
+        )
+        prof.start()
+        self.print_to_log_file(f"INFO: torch.profiler 已启用 (wait={wait}, warmup={warmup}, active={active}), "
+                               f"trace 目录: {profile_dir}")
+        return prof
+
+    def _profile_trace_handler(self, prof):
+        """on_trace_ready 回调：将 chrome trace 导出到 output_folder/profile/。
+
+        在 schedule 的 active 窗口结束时触发（RECORD_AND_SAVE），每次导出独立文件。
+        导出后调用 _annotate_profile_trace 合并 CUDA Graph kernel annotations
+        （基类为 no-op，CUDAGraph 变体训练器会 override 做语义标注合并）。
+        """
+        try:
+            profile_dir = join(self.output_folder, 'profile')
+            maybe_mkdir_p(profile_dir)
+            trace_file = join(profile_dir, f"trace_rank{self.local_rank}_step{prof.step_num}.json")
+            prof.export_chrome_trace(trace_file)
+            if self.local_rank == 0:
+                self.print_to_log_file(f"INFO: profile trace 已导出: {trace_file}")
+            # CUDA Graph 语义标注合并（CUDAGraph 变体训练器 override 此方法）
+            self._annotate_profile_trace(trace_file)
+        except Exception as e:
+            self.print_to_log_file(f"WARNING: profile trace 导出失败: {e}")
+
+    def _annotate_profile_trace(self, trace_path):
+        """合并 CUDA Graph kernel annotations 到已导出的 trace。
+
+        基类默认 no-op（非 CUDAGraph 训练器无标注）。CUDAGraph 变体训练器
+        （nnUNetTrainerCUDAGraphMixin）override 此方法：用 capture 时记录的
+        mark_kernels 语义标签（forward/backward）重新组织 trace 中的 kernel
+        lane，使 graph 内 kernel 按语义分组可视化。
+        """
+        return False
+
+    def _print_profiler_summary(self, prof):
+        """profiler 停止后写入 top CUDA 算子表到 profile/summary_rank*.txt（仅 rank 0）。
+
+        该表是算子级性能分析的核心产出：按 self_cuda_time_total 排序，
+        可定位具体算子的 CUDA 耗时、kernel 调用次数与占比。
+        只写文件，不打印到 stdout，避免污染训练日志。
+        """
+        if self.local_rank != 0:
+            return
+        try:
+            table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30)
+            summary_file = join(self.output_folder, 'profile', f'summary_rank{self.local_rank}.txt')
+            with open(summary_file, 'w') as f:
+                f.write(table)
+            self.print_to_log_file(f"INFO: profiler summary 已写入: {summary_file}")
+        except Exception as e:
+            self.print_to_log_file(f"WARNING: profiler summary 生成失败: {e}")
+
     def run_training(self):
         self.on_train_start()
 
-        for epoch in range(self.current_epoch, self.num_epochs):
-            self.on_epoch_start()
+        # 性能分析：由 -profile 命令行参数或 nnUNet_profile 环境变量启用 torch.profiler
+        # profiler 启动后每 iteration 调用 step()，验证循环不参与采样
+        profiler = self._maybe_start_profiler()
 
-            self.on_train_epoch_start()
-            train_outputs = []
-            total_imgs = self.num_iterations_per_epoch * self.batch_size
-            with tqdm(total=total_imgs, desc=f"Epoch {epoch} Train",
-                      unit="img", leave=False, disable=self.local_rank != 0) as pbar:
-                for batch_id in range(self.num_iterations_per_epoch):
-                    output = self.train_step(next(self.dataloader_train))
-                    train_outputs.append(output)
-                    pbar.update(self.batch_size)
-                    pbar.set_postfix(loss=float(output['loss']))
-            self.on_train_epoch_end(train_outputs)
+        try:
+            for epoch in range(self.current_epoch, self.num_epochs):
+                self.on_epoch_start()
 
-            with torch.no_grad():
-                self.on_validation_epoch_start()
-                val_outputs = []
-                total_val_imgs = self.num_val_iterations_per_epoch * self.batch_size
-                with tqdm(total=total_val_imgs, desc=f"Epoch {epoch} Val",
+                self.on_train_epoch_start()
+                train_outputs = []
+                total_imgs = self.num_iterations_per_epoch * self.batch_size
+                with tqdm(total=total_imgs, desc=f"Epoch {epoch} Train",
                           unit="img", leave=False, disable=self.local_rank != 0) as pbar:
-                    for batch_id in range(self.num_val_iterations_per_epoch):
-                        output = self.validation_step(next(self.dataloader_val))
-                        val_outputs.append(output)
+                    for batch_id in range(self.num_iterations_per_epoch):
+                        output = self.train_step(next(self.dataloader_train))
+                        train_outputs.append(output)
+                        # 每个 iteration 采样一次 GPU 状态（NVML 调用微秒级，开销可忽略）
+                        self._accumulate_gpu_stats(self._sample_gpu_stats())
+                        # profiler 采样步进与训练 iteration 对齐（验证循环不调用 step）
+                        if profiler is not None:
+                            profiler.step()
                         pbar.update(self.batch_size)
                         pbar.set_postfix(loss=float(output['loss']))
-                self.on_validation_epoch_end(val_outputs)
+                self.on_train_epoch_end(train_outputs)
 
-            self.on_epoch_end()
+                with torch.no_grad():
+                    self.on_validation_epoch_start()
+                    val_outputs = []
+                    total_val_imgs = self.num_val_iterations_per_epoch * self.batch_size
+                    with tqdm(total=total_val_imgs, desc=f"Epoch {epoch} Val",
+                              unit="img", leave=False, disable=self.local_rank != 0) as pbar:
+                        for batch_id in range(self.num_val_iterations_per_epoch):
+                            output = self.validation_step(next(self.dataloader_val))
+                            val_outputs.append(output)
+                            pbar.update(self.batch_size)
+                            pbar.set_postfix(loss=float(output['loss']))
+                    self.on_validation_epoch_end(val_outputs)
+
+                self.on_epoch_end()
+        finally:
+            # 无论训练是否异常退出，都确保 profiler 正确停止并导出结果
+            if profiler is not None:
+                profiler.stop()
+                self._print_profiler_summary(profiler)
 
         self.on_train_end()
