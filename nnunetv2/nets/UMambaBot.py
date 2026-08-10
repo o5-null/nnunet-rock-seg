@@ -17,6 +17,8 @@ from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager
 from dynamic_network_architectures.building_blocks.helper import get_matching_instancenorm, convert_dim_to_conv_op
 from nnunetv2.utilities.network_initialization import InitWeights_He
 from mamba_ssm import Mamba
+from nnunetv2.nets.mamba2_wrapper import get_nheaddim
+from mamba_ssm.modules.mamba2 import Mamba2 as Mamba2_
 
 class UNetResDecoder(nn.Module):
     def __init__(self,
@@ -188,12 +190,17 @@ class UMambaBot(nn.Module):
                                        return_skips=True, disable_default_stem=False, stem_channels=stem_channels)
         # layer norm
         self.ln = nn.LayerNorm(features_per_stage[-1])
-        self.mamba = Mamba(
-                        d_model=features_per_stage[-1],
-                        d_state=16,  
-                        d_conv=4,    
-                        expand=2,   
-                    )
+        # 2026-08-01: Mamba1 → Mamba2 切换。瓶颈层直接处理 flat 序列
+        # (B, n_tokens, C)，用 Mamba2 内核 + headdim 计算 + chunk_size=128。
+        # 调用处 forward 需包 bf16 保护（SSM 离散化 fp16 下易 NaN）。
+        self.mamba = Mamba2_(
+            d_model=features_per_stage[-1],
+            d_state=16,
+            d_conv=4,
+            expand=2,
+            chunk_size=128,
+            headdim=get_nheaddim(features_per_stage[-1], 2),
+        )
         self.decoder = UNetResDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision)
 
     def forward(self, x):
@@ -204,7 +211,10 @@ class UMambaBot(nn.Module):
         img_dims = middle_feature.shape[2:]
         middle_feature_flat = middle_feature.view(B, C, n_tokens).transpose(-1, -2)
         middle_feature_flat = self.ln(middle_feature_flat) 
-        out = self.mamba(middle_feature_flat)
+        # Mamba2 SSM 离散化（A_log/dt 指数）fp16 下易 NaN，bf16 保护
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=middle_feature_flat.is_cuda):
+            out = self.mamba(middle_feature_flat)
+        out = out.to(middle_feature_flat.dtype)
         out = out.transpose(-1, -2).view(B, C, *img_dims)
         skips[-1] = out
         
