@@ -36,6 +36,7 @@ import os
 import time
 
 import torch
+import torch.distributed as dist
 from torch.amp import autocast
 from batchgenerators.utilities.file_and_folder_operations import (
     load_json, save_json, join, isfile, maybe_mkdir_p)
@@ -138,7 +139,7 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
     # ------------------------------------------------------------------
     # 探测核心
     # ------------------------------------------------------------------
-    def _probe_batch_size(self):
+    def _probe_batch_size_impl(self):
         """power 逼近探测最大可承受 batch（不超 target）。返回实际 batch。
 
         判定标准（关键）:
@@ -161,6 +162,17 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
         patch = self.configuration_manager.patch_size
         total_mb = nvml['total_mb'] if nvml else None
         baseline_used_mb = nvml['used_mb'] if nvml else None
+        if total_mb is None:
+            # NVML 不可用（pynvml 未安装等）fallback: torch 侧物理显存查询
+            # 不依赖 pynvml，同样能拿到整卡物理容量（无 used_mb/功耗信息）
+            try:
+                total_mb = torch.cuda.get_device_properties(
+                    self.device).total_memory / 1024 ** 2
+                self.print_to_log_file(
+                    f"[BatchProbe] NVML absent — torch physical VRAM fallback: "
+                    f"total={total_mb:.0f}MB")
+            except Exception:
+                total_mb = None
         self.print_to_log_file(
             f"[BatchProbe] plans batch={plans_bs}, target={target}, cap={cap}, "
             f"GPU physical: total={total_mb}MB, used_now={baseline_used_mb}MB "
@@ -177,6 +189,14 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
             self.grad_accum_steps = max(1, -(-target // plans_bs)) if plans_bs < target else 1
             return plans_bs
 
+        # 物理显存完全不可知（NVML + torch 查询都失败）→ 仅靠 OOM 判定，
+        # 无法做单点外推/二分（都依赖 total_mb），退化为倍增探测
+        if total_mb is None:
+            self.print_to_log_file(
+                "[BatchProbe] no physical VRAM info at all — fall back to "
+                "OOM-only doubling probe")
+            return self._probe_batch_size_oom_only(plans_bs, target, cap, patch)
+
         # ==================================================================
         # 单点外推法（用户要求: 只测 batch=1 一次，线性外推最大安全 batch）
         # 原理: 显存 ≈ 固定开销(权重/optimizer/CUDA context) + batch×每样本开销
@@ -186,12 +206,13 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
         # ==================================================================
         # 先预热 cuDNN benchmark（探测发生在基类 warmup 之前，若不预热则
         # 第一次 forward 触发 autotune 慢 + 分配大 workspace，污染峰值测量）
+        # 用探测网络（DDP 下已替换 SyncBN，forward 无 NCCL 同步）
         gc.collect()
         torch.cuda.empty_cache()
         warm = torch.randn((1, self.num_input_channels, *patch), device=self.device)
         with torch.no_grad():
             for _ in range(2):
-                _ = self.network(warm)
+                _ = self._probe_net(warm)
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize(self.device)
@@ -318,7 +339,166 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
             f"(imgs/epoch={self.num_iterations_per_epoch * best} ≈ "
             f"effective_imgs={effective_imgs}, "
             f"tp={best_tp:.1f} img/s, power={best_pw:.0f}W/"
-            f"{power_limit:.0f}W TDP if available)")
+            f"{(power_limit or 0):.0f}W TDP if available)")
+        return best
+
+    # ------------------------------------------------------------------
+    # DDP 安全包装: 探测期无 NCCL + 结果跨 rank 同步
+    # ------------------------------------------------------------------
+    def _probe_batch_size(self):
+        """DDP 安全包装: 探测换裸网络（消除 NCCL）+ 前后 barrier + 结果全局 min。
+
+        背景（2026-08-11 DGX 2 卡事故）: initialize() 在 _warmup_kernels 之前
+        已把 network 包成 DDP + SyncBatchNorm。原探测直接用 self.network 做
+        forward+backward → SyncBN forward 的 all-reduce 与 DDP backward 的
+        梯度 all-reduce 在各 rank 探测序列/时机不同步时 collective 错位，
+        NCCL 死锁 600s 超时（且 OOM 中断 backward 会污染 NCCL work 队列）。
+        修复: 探测阶段换用裸网络（network.module）并临时替换 SyncBatchNorm
+        → BatchNorm，探测期彻底无 NCCL；探测结束 barrier 对齐后 all_reduce
+        取全局最小 batch（V100-32GB 与 16GB 卡探测值不同，DDP 训练要求
+        所有 rank batch 一致，取 min 保证小卡不 OOM）。返回值即同步后的
+        batch（_warmup_kernels 的 _apply_probe_result 消费它）。
+        """
+        if self.device.type != 'cuda' or not self.do_batch_probe:
+            return self.batch_size
+
+        restore = self._enter_probe_network()
+        try:
+            if self.is_ddp:
+                # 显式 device_ids 避免 torch 提示"用当前设备"的 UserWarning
+                # （run_ddp 已 set_device(cuda, rank)，这里只是消除噪音）
+                dist.barrier(device_ids=[self.device.index])
+            best = self._probe_batch_size_impl()
+        finally:
+            restore()   # 还原 SyncBatchNorm（训练继续用 DDP 网络）
+
+        if self.is_ddp:
+            # 所有 rank 探测完才进入 warmup/training（避免一方先进入 warmup
+            # Phase 2 的真实 DDP 同步而另一方还在探测 → collective 错位）
+            dist.barrier(device_ids=[self.device.index])
+            # 探测结果同步: 各 rank 用自己的卡探测出不同 batch，DDP 训练
+            # batch 必须全局一致 → 取所有 rank 最小值（小卡不 OOM）
+            best_t = torch.tensor([self.actual_batch_size],
+                                  device=self.device, dtype=torch.int32)
+            dist.all_reduce(best_t, op=dist.ReduceOp.MIN)
+            best = int(best_t.item())
+            self.actual_batch_size = best
+            # 基于同步后的 batch 重算派生量（探测期各 rank 用本地值算过，
+            # 同步取 min 后可能变小，累积步数/迭代数随之变化）
+            self.grad_accum_steps = max(
+                1, -(-self.nominal_batch_size // best)) \
+                if best < self.nominal_batch_size else 1
+            effective_imgs = (self.iterations_per_epoch_effective
+                              * self.nominal_batch_size)
+            self.num_iterations_per_epoch = max(1, -(-effective_imgs // best))
+            self.print_to_log_file(
+                f"[BatchProbe] DDP sync: global_min_batch={best}, "
+                f"accum={self.grad_accum_steps}, "
+                f"iters/epoch={self.num_iterations_per_epoch}")
+        return best
+
+    def _enter_probe_network(self):
+        """探测阶段用裸网络（DDP 下绕过 wrapper 的梯度同步），并临时把
+        SyncBatchNorm 替换为普通 BatchNorm（其 forward 不再触发 NCCL
+        all-reduce）。返回恢复函数。
+
+        注意: DDP 的 no_sync() 只能抑制 backward 的梯度 all-reduce，
+        SyncBatchNorm 的 forward 统计量同步无开关可关，必须替换模块。
+        convert_sync_batchnorm 复用原参数对象（非 clone），故替换为普通
+        BN 不影响 optimizer 绑定，探测后还原即可。
+        """
+        self._probe_net = self.network.module if self.is_ddp else self.network
+        # 仅 DDP 下才存在 SyncBN（convert_sync_batchnorm 在 DDP wrap 前调用）
+        if not self.is_ddp:
+            return lambda: None
+        import torch.nn as nn
+        is_3d = len(self.configuration_manager.patch_size) == 3
+        bn_cls = nn.BatchNorm3d if is_3d else nn.BatchNorm2d
+        replaced = []   # [(parent, attr, original_module)]
+        for name, mod in self._probe_net.named_modules():
+            if isinstance(mod, nn.SyncBatchNorm):
+                bn = bn_cls(mod.num_features, eps=mod.eps,
+                            momentum=mod.momentum, affine=mod.affine,
+                            track_running_stats=mod.track_running_stats)
+                if mod.affine:
+                    bn.weight.data.copy_(mod.weight.data)
+                    bn.bias.data.copy_(mod.bias.data)
+                # track_running_stats=False 时 running_* 为 None，需判空
+                if mod.running_mean is not None:
+                    bn.running_mean.copy_(mod.running_mean)
+                    bn.running_var.copy_(mod.running_var)
+                    bn.num_batches_tracked.copy_(mod.num_batches_tracked)
+                parent_name, _, attr = name.rpartition('.')
+                parent = (self._probe_net.get_submodule(parent_name)
+                          if parent_name else self._probe_net)
+                setattr(parent, attr, bn)
+                replaced.append((parent, attr, mod))
+        if replaced:
+            self.print_to_log_file(
+                f"[BatchProbe] probe network: replaced {len(replaced)} "
+                f"SyncBatchNorm → {bn_cls.__name__} (no NCCL during probe)")
+
+        # 探测阶段必须同时关闭 loss 的 DDP all-gather: nnUNet 的 DiceLoss
+        # 在 ddp=True & batch_dice=True 时用 AllGatherGrad —— 其 forward 即
+        # torch.distributed.all_gather、backward 即 all_reduce（见
+        # nnunetv2/utilities/ddp_allgather.py）。即使探测网络是裸网络，
+        # loss 内部仍会触发 NCCL → 两个 rank 探测节奏不同即 collective
+        # 错位死锁（2026-08-11 DGX 实测卡死在 probe batch=1&2）。
+        # ddp=False 后 loss 退化为纯本地计算（batch_dice 聚合不涉及 dist）。
+        self._probe_loss_ddp_backup = []
+        for mod in self.loss.modules():
+            if hasattr(mod, 'ddp') and getattr(mod, 'ddp'):
+                self._probe_loss_ddp_backup.append(mod)
+                mod.ddp = False
+        if self._probe_loss_ddp_backup:
+            self.print_to_log_file(
+                f"[BatchProbe] probe loss: disabled ddp all-gather on "
+                f"{len(self._probe_loss_ddp_backup)} loss module(s)")
+
+        def restore():
+            for parent, attr, orig in replaced:
+                setattr(parent, attr, orig)
+            for mod in self._probe_loss_ddp_backup:
+                mod.ddp = True
+        return restore
+
+    def _probe_batch_size_oom_only(self, plans_bs, target, cap, patch):
+        """物理显存完全不可知（NVML + torch 查询均失败）时的退化路径:
+        仅靠 OOM 判定，无法做单点外推/二分（都依赖 total_mb）。
+
+        策略: batch=4 起倍增（4,8,16,...cap，batch=1/2 已由差分测量成功），
+        首个 OOM 即停，取最后成功档。_probe_measure 在 nvml=None 时:
+        - 峰值用 torch.cuda.max_memory_allocated（无 NVML 依赖）
+        - 安全阀 ratio=None → 跳过
+        - 功耗 0 且 power_limit=None → 满载判定恒 False
+        唯一判据就是 OOM 异常兜底。
+        """
+        gc.collect()
+        torch.cuda.empty_cache()
+        best, best_tp, best_peak = 1, 0.0, 0.0
+        b = 4
+        while b <= cap:
+            ok, peak_mb, tp, pw, note = self._probe_measure(b, patch, None, None)
+            if not ok:
+                self.print_to_log_file(
+                    f"[BatchProbe]   batch={b} {note or 'failed'} — stop "
+                    f"(OOM-only path)")
+                break
+            best, best_tp, best_peak = b, tp, peak_mb
+            self.print_to_log_file(
+                f"[BatchProbe]   batch={b} OK: peak={peak_mb:.0f}MB, "
+                f"tp={tp:.1f} img/s")
+            b *= 2
+        self.actual_batch_size = best
+        self.grad_accum_steps = max(1, -(-self.nominal_batch_size // best)) \
+            if best < self.nominal_batch_size else 1
+        effective_imgs = self.iterations_per_epoch_effective * self.nominal_batch_size
+        self.num_iterations_per_epoch = max(1, -(-effective_imgs // best))
+        self.print_to_log_file(
+            f"[BatchProbe] RESULT (OOM-only): actual_batch={best}, "
+            f"grad_accum_steps={self.grad_accum_steps}, "
+            f"num_iterations_per_epoch={self.num_iterations_per_epoch}, "
+            f"tp={best_tp:.1f} img/s")
         return best
 
     def _probe_measure(self, batch: int, patch, nvml, total_mb):
@@ -378,6 +558,10 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
             return True, peak_mb, tp, power_peak, None
         except RuntimeError as e:
             if self._is_oom(e):
+                # OOM 后释放缓存块 + 回收 Python 对象，避免碎片/残留导致
+                # 后续更小 batch 档误判 OOM（实测 32GB 卡 batch=7 误报）
+                gc.collect()
+                torch.cuda.empty_cache()
                 self.probe_log.append({'batch': batch, 'peak_mb': None,
                                        'oom': str(e)[:120]})
                 return False, None, 0.0, 0.0, 'OOM'
@@ -390,11 +574,14 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
         显存测量，step 会让权重漂移影响后续训练）。DS 模式下 target 需
         按每个输出分辨率生成 list（DeepSupervisionWrapper 断言要求）。
         """
+        # 探测用裸网络（DDP 下 _probe_net = network.module + BN 替换），
+        # 非 DDP 时 _probe_net = self.network，与基类行为一致
+        net = getattr(self, '_probe_net', self.network)
         num_output_channels = self.label_manager.num_segmentation_heads
         dummy_batch = torch.randn(
             (batch, self.num_input_channels, *patch), device=self.device)
         with torch.no_grad():
-            dummy_out = self.network(dummy_batch)
+            dummy_out = net(dummy_batch)
         ds_output_shapes = [o.shape for o in dummy_out] if isinstance(dummy_out, (list, tuple)) else None
         if ds_output_shapes is not None:
             dummy_target = [
@@ -408,7 +595,7 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
                 device=self.device, dtype=torch.long)
         with torch.autocast(self.device.type, dtype=self.autocast_dtype,
                             enabled=self.device.type == 'cuda'):
-            output = self.network(dummy_batch)
+            output = net(dummy_batch)
             l = self.loss(output, dummy_target)
         l.backward()
         # 不 step，仅测量; zero_grad 释放梯度供下一档复用

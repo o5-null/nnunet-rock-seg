@@ -41,6 +41,11 @@ class nnUNetTrainerSegResNet(nnUNetTrainer_MedNeXtBase):
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
 
+        # norm 必须用 INSTANCE 而非 MONAI 默认的 GROUP: torch 2.7 的
+        # GroupNorm CUDA kernel 在 V100(sm_70) 上不兼容 —— 实测报
+        # "CUDA error: operation not supported on global/shared address
+        # space"（kernel 含 V100 不支持的指令），SegResNet forward 必崩
+        # （2026-08-11 DGX 定位，InstanceNorm 验证通过）。
         model = SegResNet(
             spatial_dims = len(configuration_manager.patch_size),
             init_filters = 32,
@@ -48,6 +53,7 @@ class nnUNetTrainerSegResNet(nnUNetTrainer_MedNeXtBase):
             out_channels=num_output_channels,
             blocks_down=[1, 2, 2, 4],
             blocks_up=[1, 1, 1],
+            norm=('INSTANCE', {'affine': True}),
         )
 
         return model

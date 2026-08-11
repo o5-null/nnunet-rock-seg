@@ -2,7 +2,7 @@ import multiprocessing
 import os
 import socket
 import sys
-from typing import Union, Optional
+from typing import Union, Optional, List
 
 # === Default environment optimizations for RTX 3080 (Ampere) ===
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
@@ -151,11 +151,14 @@ def exit_on_interrupt(msg: str, code: int = 130):
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size, num_epochs=None, probe_mode='auto',
-            profile_config=None):
+            profile_config=None, gpu_indices=None):
     setup_ddp(rank, world_size)
-    torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
+    # gpu_indices 为 -gpu 列表指定的各进程物理卡（未指定时按 rank 连续编号）
+    gpu_idx = gpu_indices[rank] if gpu_indices else rank
+    torch.cuda.set_device(torch.device('cuda', gpu_idx))
 
-    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p, c)
+    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p, c,
+                                           device=torch.device('cuda', gpu_idx))
 
     # 命令行 -epoch 覆盖 trainer 默认值（优先级高于 trainer 类自带设置）
     # 必须在 run_training() 调用前设置，确保 LR scheduler 与训练循环都使用新值
@@ -210,6 +213,7 @@ def run_training(dataset_name_or_id: Union[str, int],
                  val_with_best: bool = False,
                  num_epochs: Optional[int] = None,
                  device: torch.device = torch.device('cuda'),
+                 gpu_list: Optional[List[int]] = None,
                  probe_mode: str = 'auto',
                  profile_config: Optional[str] = None):
     # Enable TF32 on Ampere+ GPUs for ~1.5x matmul speedup
@@ -235,6 +239,18 @@ def run_training(dataset_name_or_id: Union[str, int],
     if num_gpus > 1:
         assert device.type == 'cuda', f"DDP training (triggered by num_gpus > 1) is only implemented for cuda devices. Your device: {device}"
 
+        # DDP 各进程绑定的物理 GPU:
+        #  -gpu 0,5,6,7 显式列表 -> 按列表一一映射到 rank
+        #  -device cuda:N / 默认 -> 从 N(默认 0) 起连续 num_gpus 张卡
+        if gpu_list is not None:
+            assert len(gpu_list) == num_gpus, \
+                f'-gpu {gpu_list} has {len(gpu_list)} entries but num_gpus={num_gpus}. They must match.'
+            gpu_indices = list(gpu_list)
+        else:
+            base_gpu = device.index if device.index is not None else 0
+            gpu_indices = list(range(base_gpu, base_gpu + num_gpus))
+        print(f"DDP: {num_gpus} processes -> physical GPUs {gpu_indices}")
+
         os.environ['MASTER_ADDR'] = 'localhost'
         if 'MASTER_PORT' not in os.environ.keys():
             port = str(find_free_network_port())
@@ -257,10 +273,14 @@ def run_training(dataset_name_or_id: Union[str, int],
                      num_gpus,
                      num_epochs,
                      probe_mode,
-                     profile_config),
+                     profile_config,
+                     gpu_indices),
                  nprocs=num_gpus,
                  join=True)
     else:
+        # 单进程训练: gpu_list 若给出必须恰好 1 张（-gpu 1 即 cuda:gpu_list[0]）
+        assert gpu_list is None or len(gpu_list) == 1, \
+            f'-gpu {gpu_list} implies DDP (multi-GPU) but num_gpus={num_gpus}. Use -num_gpus {len(gpu_list)} or a single -gpu index.'
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
                                                plans_identifier, continue_training, device=device)
 
@@ -337,9 +357,15 @@ def run_training_entry():
                         help='[OPTIONAL] Set this flag to disable checkpointing. Ideal for testing things out and '
                              'you dont want to flood your hard drive with checkpoints.')
     parser.add_argument('-device', type=str, default='cuda', required=False,
-                    help="Use this to set the device the training should run with. Available options are 'cuda' "
-                         "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
-                         "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!")
+                        help="Set the device for training: 'cuda' (GPU, default), 'cpu', 'mps', "
+                             "or 'cuda:N' to pick a specific physical GPU by index (e.g. 'cuda:1'). "
+                             "Index selects the physical GPU directly, no CUDA_VISIBLE_DEVICES needed. "
+                             "Alternative: use -gpu N.")
+    parser.add_argument('-gpu', type=str, default=None, required=False,
+                        help='[OPTIONAL] Select physical GPU(s) by index directly, comma-separated. '
+                             'Single: -gpu 1 (= -device cuda:1). Multi-GPU DDP: -gpu 0,5,6,7 uses '
+                             'exactly those 4 physical GPUs (-num_gpus is derived from the list). '
+                             'Overrides CUDA_VISIBLE_DEVICES remapping.')
     parser.add_argument('-epoch', type=int, default=None, required=False,
                         help='[OPTIONAL] 覆盖 trainer 的训练 epoch 数。不传则使用 trainer 类自带默认值 '
                              '(nnUNetTrainer 默认 1000，变体如 nnUNetTrainer_100epochs 带 100)。'
@@ -357,23 +383,80 @@ def run_training_entry():
                              '优先级高于环境变量 nnUNet_profile。')
     args = parser.parse_args()
 
-    assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
-    if args.device == 'cpu':
-        # let's allow torch to use hella threads
-        torch.set_num_threads(multiprocessing.cpu_count())
-        device = torch.device('cpu')
-    elif args.device == 'cuda':
-        # multithreading in torch doesn't help nnU-Net if run on GPU
+    # --- 解析 -device 与 -gpu，支持直接按物理索引选卡（无需 CUDA_VISIBLE_DEVICES 重映射） ---
+    def _parse_device_arg(device_str: str) -> torch.device:
+        """解析 -device 字符串: cpu / mps / cuda / cuda:N（N 为物理 GPU 索引）。"""
+        if device_str == 'cpu':
+            return torch.device('cpu')
+        if device_str == 'mps':
+            return torch.device('mps')
+        if device_str == 'cuda':
+            return torch.device('cuda')
+        if device_str.startswith('cuda:'):
+            try:
+                idx = int(device_str.split(':', 1)[1])
+                return torch.device('cuda', idx)
+            except ValueError as e:
+                raise ValueError(f'Invalid -device value: {device_str!r}. Expected cuda:N with N an integer.') from e
+        raise ValueError(f'-device must be one of cpu / cuda / cuda:N / mps. Got: {device_str!r}')
+
+    def _parse_gpu_list(gpu_str: str) -> List[int]:
+        """解析 -gpu 参数: 逗号分隔的物理 GPU 索引列表, 如 '0,5,6,7' -> [0,5,6,7]。"""
+        parts = [p.strip() for p in gpu_str.split(',') if p.strip()]
+        if not parts:
+            raise ValueError(f'Invalid -gpu value: {gpu_str!r}. Expected comma-separated GPU indices.')
+        try:
+            indices = [int(p) for p in parts]
+        except ValueError as e:
+            raise ValueError(f'Invalid -gpu value: {gpu_str!r}. Expected comma-separated integer GPU indices.') from e
+        if len(set(indices)) != len(indices):
+            raise ValueError(f'Duplicate GPU index in -gpu {gpu_str!r}.')
+        return indices
+
+    device = _parse_device_arg(args.device)
+    gpu_list = _parse_gpu_list(args.gpu) if args.gpu is not None else None
+
+    # -gpu 与 -device cuda:M 冲突检测；-gpu 仅对 cuda 有效
+    if gpu_list is not None:
+        if device.type != 'cuda':
+            raise ValueError(f'-gpu {args.gpu} is only valid together with a cuda device. Got -device {args.device}.')
+        if device.index is not None:
+            # -device cuda:M 只能与单元素且等值的 -gpu 列表共存
+            if len(gpu_list) != 1 or gpu_list[0] != device.index:
+                raise ValueError(f'Conflicting GPU selection: -device {args.device} vs -gpu {args.gpu}. Use only one of them.')
+        device = torch.device('cuda', gpu_list[0])
+
+    # -gpu 列表隐含 DDP 进程数: 与显式 -num_gpus 对齐检查（默认 1 时自动派生）
+    if gpu_list is not None and len(gpu_list) > 1:
+        if args.num_gpus != 1 and args.num_gpus != len(gpu_list):
+            raise ValueError(f'-gpu {args.gpu} selects {len(gpu_list)} GPUs, but -num_gpus {args.num_gpus} was given. '
+                             f'Remove -num_gpus or align it with the -gpu list length.')
+        args.num_gpus = len(gpu_list)
+
+    # 显式指定物理索引（-gpu 列表 或 -device cuda:N）时，清除 CUDA_VISIBLE_DEVICES 重映射，
+    # 保证索引即物理 GPU 序号（torch 与 NVML 索引对齐）
+    explicit_indices = gpu_list if gpu_list is not None else (
+        [device.index] if (device.type == 'cuda' and device.index is not None) else None)
+    if explicit_indices is not None:
+        if 'CUDA_VISIBLE_DEVICES' in os.environ:
+            print(f"WARNING: -gpu/-device cuda:N selects physical GPU(s) {explicit_indices}; "
+                  f"unsetting CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r} to avoid remapping.")
+            os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+
+    if args.device in ['cpu', 'mps']:
+        # cpu: 让 torch 用满线程；mps 无特殊设置
+        if device.type == 'cpu':
+            torch.set_num_threads(multiprocessing.cpu_count())
+    else:
+        # cuda 训练: 多线程对 GPU 无益，反而引入开销
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
-        device = torch.device('cuda')
-    else:
-        device = torch.device('mps')
 
     try:
         run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                      args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                     num_epochs=args.epoch, device=device, probe_mode=args.probe, profile_config=args.profile)
+                     num_epochs=args.epoch, device=device, gpu_list=gpu_list,
+                     probe_mode=args.probe, profile_config=args.profile)
     except KeyboardInterrupt:
         # 兜底：正常情况下 KeyboardInterrupt 已在 run_training() 内部处理，
         # 此处覆盖 trainer 尚未创建（如 argparse/环境准备阶段）就中断的场景。

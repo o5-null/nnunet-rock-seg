@@ -105,11 +105,16 @@ class nnUNetTrainer(object):
             print(f"I am local rank {self.local_rank}. {device_count()} GPUs are available. The world size is "
                   f"{dist.get_world_size()}."
                   f"Setting device to {self.device}")
-            self.device = torch.device(type='cuda', index=self.local_rank)
+            # 未显式指定索引时按 DDP rank 绑定（默认行为）；run_ddp 已传入带 base_gpu 偏移的
+            # 索引时保留该索引（-gpu/-device cuda:N 指定起始物理卡）
+            if self.device.index is None:
+                self.device = torch.device(type='cuda', index=self.local_rank)
         else:
             if self.device.type == 'cuda':
-                # we might want to let the user pick this but for now please pick the correct GPU with CUDA_VISIBLE_DEVICES=X
-                self.device = torch.device(type='cuda', index=0)
+                # 支持直接按物理索引选卡（-gpu N / -device cuda:N），未指定时默认 cuda:0。
+                # 不再需要 CUDA_VISIBLE_DEVICES 重映射。
+                if self.device.index is None:
+                    self.device = torch.device(type='cuda', index=0)
             print(f"Using device: {self.device}")
 
         # loading and saving this class for continuing from checkpoint should not happen based on pickling. This
@@ -818,17 +823,55 @@ class nnUNetTrainer(object):
             import pynvml
             pynvml.nvmlInit()
             self._gpu_nvml = pynvml
-            # DDP 时 local_rank 即当前进程绑定的 GPU 索引；非 DDP 单卡为 0
-            self._gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(self.local_rank)
+            # 关键: NVML 的 index 是物理 GPU 序号（不受 CUDA_VISIBLE_DEVICES 影响），
+            # 而 self.device.index 是逻辑索引（受其影响）。直接用 local_rank 会在
+            # 多卡 + CUDA_VISIBLE_DEVICES 时监控到错误的卡（显示空闲卡）。
+            # 这里把逻辑索引映射为物理索引，保证监控落在实际使用的卡上。
+            phys_idx = self._get_physical_gpu_index()
+            self._gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(phys_idx)
             if self.local_rank == 0:
                 self.print_to_log_file(
-                    f"[GPU monitor] NVML ready: {pynvml.nvmlDeviceGetName(self._gpu_handle)}")
+                    f"[GPU monitor] NVML ready: {pynvml.nvmlDeviceGetName(self._gpu_handle)} "
+                    f"(logical cuda:{self.device.index if self.device.type == 'cuda' else 0} -> physical {phys_idx})")
         except Exception as e:
             self._gpu_nvml = None
             self._gpu_handle = None
             if self.local_rank == 0:
                 self.print_to_log_file(
                     f"[GPU monitor] NVML unavailable ({e}), falling back to torch.cuda memory only")
+
+    def _get_physical_gpu_index(self) -> int:
+        """把 torch 逻辑 CUDA 索引映射为 NVML 物理 GPU 索引。
+
+        torch 的 cuda:N 是逻辑索引，受 CUDA_VISIBLE_DEVICES 重映射（如设为 "2,3"
+        时逻辑 0 对应物理 2）；而 nvmlDeviceGetHandleByIndex 的 index 是物理序号，
+        二者必须对齐，否则监控会落到错误的卡上。
+
+        优先按 CUDA_VISIBLE_DEVICES 数字列表解析；若为 GPU-UUID 格式则用 NVML
+        按 UUID 反查；未设置环境变量时逻辑索引即物理索引。
+        """
+        if self.device.type != 'cuda':
+            return 0
+        logical = self.device.index if self.device.index is not None else 0
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        parts = [p.strip() for p in visible.split(',') if p.strip()]
+        if not parts or logical >= len(parts):
+            return logical  # 未设置或越界: 逻辑即物理
+        token = parts[logical]
+        try:
+            return int(token)  # 数字格式 "0,1,2"
+        except ValueError:
+            pass
+        # GPU-UUID 格式 (GPU-xxxxxxxx-...): 用 NVML 按 UUID 反查物理索引
+        if self._gpu_nvml is not None:
+            try:
+                for i in range(self._gpu_nvml.nvmlDeviceGetCount()):
+                    h = self._gpu_nvml.nvmlDeviceGetHandleByIndex(i)
+                    if str(self._gpu_nvml.nvmlDeviceGetUUID(h)) == token:
+                        return i
+            except Exception:
+                pass
+        return 0  # 匹配失败兜底
 
     def _sample_gpu_stats(self) -> dict:
         """采样一次 GPU 状态。
@@ -859,6 +902,27 @@ class nnUNetTrainer(object):
             except Exception:
                 pass
         return stats
+
+    def _sample_all_gpus(self) -> List[tuple]:
+        """现场采样所有物理 GPU 的 util / 显存（不聚合，仅用于全卡概览）。
+
+        返回 [(物理索引, util%, 已用显存MB), ...]；NVML 不可用时返回空列表。
+        """
+        if self._gpu_nvml is None:
+            return []
+        rows = []
+        try:
+            for i in range(self._gpu_nvml.nvmlDeviceGetCount()):
+                try:
+                    h = self._gpu_nvml.nvmlDeviceGetHandleByIndex(i)
+                    util = self._gpu_nvml.nvmlDeviceGetUtilizationRates(h).gpu
+                    mem = self._gpu_nvml.nvmlDeviceGetMemoryInfo(h).used / 1024 ** 2
+                    rows.append((i, float(util), mem))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return rows
 
     def _accumulate_gpu_stats(self, stats: dict):
         """将一次采样累积到聚合器（均值 + 峰值），不保存逐条样本，零内存增长。"""
@@ -899,6 +963,14 @@ class nnUNetTrainer(object):
             parts.append(f'proc_resv {reserved:6.0f}MB (max {agg["mem_reserved_mb_max"]:6.0f}MB)')
         if parts:
             self.print_to_log_file('GPU           ' + ', '.join(parts))
+
+        # 多卡机器: 顺带打印全卡实时概览（现场采样，不聚合），
+        # 便于一眼确认进程绑定的卡以及其余卡的空闲/占用情况
+        all_gpus = self._sample_all_gpus()
+        if len(all_gpus) > 1:
+            overview = ', '.join(
+                f'{i}:{u:3.0f}%/{m / 1024:.1f}G' for i, u, m in all_gpus)
+            self.print_to_log_file('GPU all       ' + overview)
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
@@ -2033,7 +2105,11 @@ class nnUNetTrainer(object):
 
                 self.on_train_epoch_start()
                 train_outputs = []
-                total_imgs = self.num_iterations_per_epoch * self.batch_size
+                # 全局吞吐显示: DDP 下 self.batch_size 是每卡值，tqdm 速率乘
+                # world_size 才反映全局 img/s（2026-08-11 用户要求）
+                world_size = dist.get_world_size() if self.is_ddp else 1
+                effective_batch = self.batch_size * world_size
+                total_imgs = self.num_iterations_per_epoch * effective_batch
                 with tqdm(total=total_imgs, desc=f"Epoch {epoch} Train",
                           unit="img", leave=False, disable=self.local_rank != 0) as pbar:
                     for batch_id in range(self.num_iterations_per_epoch):
@@ -2044,20 +2120,20 @@ class nnUNetTrainer(object):
                         # profiler 采样步进与训练 iteration 对齐（验证循环不调用 step）
                         if profiler is not None:
                             profiler.step()
-                        pbar.update(self.batch_size)
+                        pbar.update(effective_batch)
                         pbar.set_postfix(loss=float(output['loss']))
                 self.on_train_epoch_end(train_outputs)
 
                 with torch.no_grad():
                     self.on_validation_epoch_start()
                     val_outputs = []
-                    total_val_imgs = self.num_val_iterations_per_epoch * self.batch_size
+                    total_val_imgs = self.num_val_iterations_per_epoch * effective_batch
                     with tqdm(total=total_val_imgs, desc=f"Epoch {epoch} Val",
                               unit="img", leave=False, disable=self.local_rank != 0) as pbar:
                         for batch_id in range(self.num_val_iterations_per_epoch):
                             output = self.validation_step(next(self.dataloader_val))
                             val_outputs.append(output)
-                            pbar.update(self.batch_size)
+                            pbar.update(effective_batch)
                             pbar.set_postfix(loss=float(output['loss']))
                     self.on_validation_epoch_end(val_outputs)
 
