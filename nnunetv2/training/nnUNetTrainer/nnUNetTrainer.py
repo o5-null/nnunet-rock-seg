@@ -711,7 +711,11 @@ class nnUNetTrainer(object):
             if also_print_to_console:
                 print(*args)
         elif also_print_to_console:
-            print(*args)
+            # 非 rank0 不再打终端: 3 rank 都 print_to_log_file 会让终端重复
+            # 显示初始化日志（rank1/2 无时间戳 + rank0 带时间戳，2026-08-11）。
+            # 单卡（local_rank=0）不受影响。
+            if self.local_rank == 0:
+                print(*args)
 
     def print_plans(self):
         if self.local_rank == 0:
