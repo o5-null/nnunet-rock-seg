@@ -160,6 +160,11 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     # gpu_indices 为 -gpu 列表指定的各进程物理卡（未指定时按 rank 连续编号）
     gpu_idx = gpu_indices[rank] if gpu_indices else rank
     torch.cuda.set_device(torch.device('cuda', gpu_idx))
+    if gpu_indices is not None:
+        print(f"[run_ddp] rank {rank}: physical GPU {gpu_idx} (from -gpu {gpu_indices})")
+    else:
+        print(f"[run_ddp] rank {rank}: physical GPU {gpu_idx} "
+              f"(default sequential 0..{world_size - 1}; pass -gpu to pick specific GPUs)")
 
     nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p, c,
                                            device=torch.device('cuda', gpu_idx))
@@ -261,26 +266,39 @@ def run_training(dataset_name_or_id: Union[str, int],
             print(f"using port {port}")
             os.environ['MASTER_PORT'] = port  # str(port)
 
-        mp.spawn(run_ddp,
-                 args=(
-                     dataset_name_or_id,
-                     configuration,
-                     fold,
-                     trainer_class_name,
-                     plans_identifier,
-                     disable_checkpointing,
-                     continue_training,
-                     only_run_validation,
-                     pretrained_weights,
-                     export_validation_probabilities,
-                     val_with_best,
-                     num_gpus,
-                     num_epochs,
-                     probe_mode,
-                     profile_config,
-                     gpu_indices),
-                 nprocs=num_gpus,
-                 join=True)
+        procs = mp.spawn(run_ddp,
+                         args=(
+                             dataset_name_or_id,
+                             configuration,
+                             fold,
+                             trainer_class_name,
+                             plans_identifier,
+                             disable_checkpointing,
+                             continue_training,
+                             only_run_validation,
+                             pretrained_weights,
+                             export_validation_probabilities,
+                             val_with_best,
+                             num_gpus,
+                             num_epochs,
+                             probe_mode,
+                             profile_config,
+                             gpu_indices),
+                         nprocs=num_gpus,
+                         join=False)
+        try:
+            for p in procs:
+                p.join()
+        except KeyboardInterrupt:
+            # 主进程 Ctrl+C: 主动终止所有 rank 子进程，防止孤儿进程滞留。
+            # spawn 子进程是独立进程，主进程 os._exit 不会带走它们；rank 若
+            # 阻塞在 NCCL 同步点也无法自行响应 SIGINT → 必须由主进程强制 kill。
+            alive = [p for p in procs if p.is_alive()]
+            for p in alive:
+                p.terminate()
+            for p in alive:
+                p.join(timeout=15)
+            exit_on_interrupt(f"训练被用户中断 (Ctrl+C)，{len(alive)} 个 rank 进程已强制终止。")
     else:
         # 单进程训练: gpu_list 若给出必须恰好 1 张（-gpu 1 即 cuda:gpu_list[0]）
         assert gpu_list is None or len(gpu_list) == 1, \
