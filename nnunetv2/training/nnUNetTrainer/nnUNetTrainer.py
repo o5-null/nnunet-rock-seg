@@ -296,7 +296,11 @@ class nnUNetTrainer(object):
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
-                self.network = DDP(self.network, device_ids=[self.local_rank])
+                # device_ids 必须与模型实际所在 GPU 一致（self.device.index）:
+                # 用 local_rank 在 -gpu 0,5,6,7 场景会错位（模型在 cuda:7 而
+                # DDP 假定 cuda:2 → warmup forward 报 device mismatch，
+                # 2026-08-11 3 卡实测 "cuda:2 and cuda:7"）
+                self.network = DDP(self.network, device_ids=[self.device.index])
 
             self.loss = self._build_loss()
 
@@ -352,6 +356,16 @@ class nnUNetTrainer(object):
         # ---- Phase 1: cuDNN benchmark (eval forward) ----
         if show_log:
             self.print_to_log_file("Phase 1/2 — cuDNN benchmark warmup (2 eval forward passes) ...")
+            # 诊断: device 链路（-gpu 多卡错位排查，2026-08-11）
+            try:
+                _np = next(self.network.parameters())
+                self.print_to_log_file(
+                    f"[warmup-dbg] self.device={self.device} "
+                    f"current_device={torch.cuda.current_device()} "
+                    f"net_param_device={_np.device} "
+                    f"local_rank={self.local_rank}")
+            except Exception as _e:
+                self.print_to_log_file(f"[warmup-dbg] diag failed: {_e}")
 
         dummy = torch.randn(
             (1, self.num_input_channels, *self.configuration_manager.patch_size),
