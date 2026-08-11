@@ -101,8 +101,11 @@ def setup_ddp(rank, world_size):
     # 初始化进程组并设置 NCCL 超时: 探测/DDP 一旦死锁（如 collective 错位），
     # NCCL watchdog 超时后自动 abort 进程，避免 rank 无限阻塞导致 Ctrl+C 也无法
     # 终止（SIGINT 的 KeyboardInterrupt 要等 CUDA 调用返回，而 NCCL 死等 peer）。
+    # 10min 而非 3min: 4 卡 DDP 探测时 rank0(32GB) 候选 batch 二分含多次 OOM
+    # trial，单 rank 探测可能 3-5 分钟，180s 超时会在探测 all_reduce 处误杀
+    # （2026-08-11 实测 Watchdog ALLREDUCE timeout）。
     dist.init_process_group("nccl", rank=rank, world_size=world_size,
-                            timeout=datetime.timedelta(minutes=3))
+                            timeout=datetime.timedelta(minutes=10))
 
 
 def cleanup_ddp():
