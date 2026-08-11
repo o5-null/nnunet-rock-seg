@@ -29,7 +29,10 @@ class nnUNetTrainerSegResNet(nnUNetTrainer_MedNeXtBase):
             unpack_dataset: bool = True,
             device: torch.device = torch.device('cuda')
         ):
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        # 关键字传递 device（不把 unpack_dataset 位置传给基类）：基类 nnUNetTrainer
+        # 签名只有 device，位置传 unpack_dataset 会与 device 错位（2026-08-11 DGX
+        # DDP 实测导致 self.device 无 index → 兜底 cuda:local_rank → 绑错卡）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
         self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
         self.initial_lr = 1e-4
         self.weight_decay = 1e-5
@@ -177,5 +180,8 @@ class nnUNetTrainerSegResNet_100epochs(nnUNetTrainerSegResNet):
             unpack_dataset: bool = True,
             device: torch.device = torch.device('cuda')
         ):
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        # 关键字传递 device（不把 unpack_dataset 位置传给基类）：基类 nnUNetTrainer
+        # 签名只有 device，位置传 unpack_dataset 会与 device 错位（2026-08-11 DGX
+        # DDP 实测导致 self.device 无 index → 兜底 cuda:local_rank → 绑错卡）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
         self.num_epochs = 100

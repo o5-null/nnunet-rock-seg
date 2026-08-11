@@ -302,18 +302,25 @@ def run_training(dataset_name_or_id: Union[str, int],
                          nprocs=num_gpus,
                          join=False)
         try:
-            for p in procs:
-                p.join()
+            procs.join()
         except KeyboardInterrupt:
             # 主进程 Ctrl+C: 主动终止所有 rank 子进程，防止孤儿进程滞留。
-            # spawn 子进程是独立进程，主进程 os._exit 不会带走它们；rank 若
-            # 阻塞在 NCCL 同步点也无法自行响应 SIGINT → 必须由主进程强制 kill。
-            alive = [p for p in procs if p.is_alive()]
-            for p in alive:
-                p.terminate()
-            for p in alive:
-                p.join(timeout=15)
-            exit_on_interrupt(f"训练被用户中断 (Ctrl+C)，{len(alive)} 个 rank 进程已强制终止。")
+            # torch 的 ProcessContext 不是可迭代对象，且 .pids 是方法（不是属性）
+            # → 先调用拿 PID 列表，再强杀（NCCL 阻塞的 rank 无法自行响应 SIGINT）。
+            import signal as _signal
+            _pids = getattr(procs, 'pids', None)
+            if callable(_pids):
+                _pids = _pids()
+            for _pid in (_pids or []):
+                try:
+                    os.kill(_pid, _signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                procs.join(timeout=15)
+            except Exception:
+                pass
+            exit_on_interrupt(f"训练被用户中断 (Ctrl+C)，{len(_pids or [])} 个 rank 进程已强制终止。")
     else:
         # 单进程训练: gpu_list 若给出必须恰好 1 张（-gpu 1 即 cuda:gpu_list[0]）
         assert gpu_list is None or len(gpu_list) == 1, \

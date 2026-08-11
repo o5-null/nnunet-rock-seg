@@ -56,7 +56,11 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, device)
+        # 必须关键字传递 device: MRO 中 SegResNet 等子类签名是
+        # (..., unpack_dataset=True, device=...)，位置传参会把 device 错位塞进
+        # unpack_dataset，导致 SegResNet 的 device 落回默认(无 index) → DDP 下
+        # 兜底成 cuda:local_rank → 绑错卡（2026-08-11 DGX 实测 GPU 1,2,3）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
         # 规定 batch（plans.json 名义值，仅记录/报告）vs 实际运行 batch
         # （self.batch_size，探测结果，dataloader/tqdm 真正使用的值）
         self.nominal_batch_size = self.configuration_manager.batch_size
