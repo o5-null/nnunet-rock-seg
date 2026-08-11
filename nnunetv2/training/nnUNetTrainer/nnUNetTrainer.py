@@ -976,7 +976,13 @@ class nnUNetTrainer(object):
         if reserved is not None:
             parts.append(f'proc_resv {reserved:6.0f}MB (max {agg["mem_reserved_mb_max"]:6.0f}MB)')
         if parts:
-            self.print_to_log_file('GPU           ' + ', '.join(parts))
+            # 标注本摘要对应的物理 GPU 编号（-gpu 0,5,6,7 时 rank0 → GPU[5]，
+            # 避免用户分不清单卡行是哪个卡，2026-08-11）
+            try:
+                _phys = self._get_physical_gpu_index()
+            except Exception:
+                _phys = self.device.index if self.device.type == 'cuda' else 0
+            self.print_to_log_file(f'GPU[{_phys}]       ' + ', '.join(parts))
 
         # 多卡机器: 顺带打印全卡实时概览（现场采样，不聚合），
         # 便于一眼确认进程绑定的卡以及其余卡的空闲/占用情况
