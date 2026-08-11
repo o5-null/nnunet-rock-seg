@@ -984,13 +984,14 @@ class nnUNetTrainer(object):
                 _phys = self.device.index if self.device.type == 'cuda' else 0
             self.print_to_log_file(f'GPU[{_phys}]       ' + ', '.join(parts))
 
-        # 多卡机器: 顺带打印全卡实时概览（现场采样，不聚合），
-        # 便于一眼确认进程绑定的卡以及其余卡的空闲/占用情况
+        # 只显示当前有计算负载的卡（util>0），去掉全卡扫描:
+        # 空闲卡(0.4G)与 llama 驻留卡(9.8G, util 0%)会刷屏干扰判断（2026-08-11）
         all_gpus = self._sample_all_gpus()
-        if len(all_gpus) > 1:
+        active = [(i, u, m) for i, u, m in all_gpus if u > 0]
+        if active:
             overview = ', '.join(
-                f'{i}:{u:3.0f}%/{m / 1024:.1f}G' for i, u, m in all_gpus)
-            self.print_to_log_file('GPU all       ' + overview)
+                f'{i}:{u:3.0f}%/{m / 1024:.1f}G' for i, u, m in active)
+            self.print_to_log_file('GPU active    ' + overview)
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
