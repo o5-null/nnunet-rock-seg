@@ -157,11 +157,20 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
             pretrained_weights, npz, val_with_best, world_size, num_epochs=None, probe_mode='auto',
             profile_config=None, gpu_indices=None):
     setup_ddp(rank, world_size)
-    # gpu_indices 为 -gpu 列表指定的各进程物理卡（未指定时按 rank 连续编号）
-    gpu_idx = gpu_indices[rank] if gpu_indices else rank
+    # gpu_indices 为 -gpu 列表指定的各进程物理卡（未指定时按 rank 连续编号）。
+    # 双保险: 优先读环境变量 NNUNET_DDP_GPUS（主进程 spawn 前写入，子进程继承，
+    # 比 mp.spawn args 位置传递更可靠），再回退 args 里的 gpu_indices。
+    env_gpus = os.environ.get('NNUNET_DDP_GPUS')
+    if env_gpus:
+        try:
+            gpu_idx = [int(x) for x in env_gpus.split(',') if x.strip()][rank]
+        except (ValueError, IndexError):
+            gpu_idx = gpu_indices[rank] if gpu_indices else rank
+    else:
+        gpu_idx = gpu_indices[rank] if gpu_indices else rank
     torch.cuda.set_device(torch.device('cuda', gpu_idx))
-    if gpu_indices is not None:
-        print(f"[run_ddp] rank {rank}: physical GPU {gpu_idx} (from -gpu {gpu_indices})")
+    if gpu_indices is not None or env_gpus:
+        print(f"[run_ddp] rank {rank}: physical GPU {gpu_idx} (from -gpu {gpu_indices or env_gpus})")
     else:
         print(f"[run_ddp] rank {rank}: physical GPU {gpu_idx} "
               f"(default sequential 0..{world_size - 1}; pass -gpu to pick specific GPUs)")
@@ -265,6 +274,12 @@ def run_training(dataset_name_or_id: Union[str, int],
             port = str(find_free_network_port())
             print(f"using port {port}")
             os.environ['MASTER_PORT'] = port  # str(port)
+
+        # 环境变量传递 GPU 列表（spawn 子进程继承 env，比 args 位置传递更可靠）
+        os.environ['NNUNET_DDP_GPUS'] = ','.join(str(i) for i in gpu_indices)
+        if gpu_list is None:
+            print(f"WARNING: -gpu not specified — binding ranks to sequential GPUs {gpu_indices}. "
+                  f"On shared DGX (GPU1-4 may host llama-server) use '-gpu 0,5,6,7' etc.")
 
         procs = mp.spawn(run_ddp,
                          args=(
