@@ -452,13 +452,17 @@ def build_norm_layer(cfg: Dict,
 
     requires_grad = cfg_.pop('requires_grad', True)
     cfg_.setdefault('eps', 1e-5)
-    if norm_layer is not nn.GroupNorm:
-        layer = norm_layer(num_features, **cfg_)
-        if layer_type == 'SyncBN' and hasattr(layer, '_specify_ddp_gpu_num'):
-            layer._specify_ddp_gpu_num(1)
-    else:
-        assert 'num_groups' in cfg_
-        layer = norm_layer(num_channels=num_features, **cfg_)
+    if norm_layer is nn.GroupNorm:
+        # V100(sm_70) 兼容: torch 2.7 cu128 的 GroupNorm CUDA kernel 不兼容 V100,
+        # 构造即崩(operation not supported on global/shared address space)。
+        # 拒绝静默使用, 提示改用 IN(InstanceNorm)。
+        raise RuntimeError(
+            "GroupNorm CUDA kernel 不兼容 V100(sm_70)(torch 2.7 cu128), "
+            "请将 norm_cfg 改为 {'type': 'IN', 'affine': True} 或其它 V100 兼容归一化。"
+        )
+    layer = norm_layer(num_features, **cfg_)
+    if layer_type == 'SyncBN' and hasattr(layer, '_specify_ddp_gpu_num'):
+        layer._specify_ddp_gpu_num(1)
 
     for param in layer.parameters():
         param.requires_grad = requires_grad

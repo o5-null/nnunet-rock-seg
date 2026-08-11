@@ -40,9 +40,19 @@ class MedNeXtBlock(nn.Module):
 
         # Normalization Layer. GroupNorm is used by default.
         if norm_type=='group':
-            self.norm = nn.GroupNorm(
-                num_groups=in_channels, 
-                num_channels=in_channels
+            # V100(sm_70) 兼容: torch 2.7 cu128 的 GroupNorm CUDA kernel 在 V100 上
+            # 报 "operation not supported on global/shared address space" 必崩。
+            # 此处 num_groups == num_channels(逐通道), 等价于 InstanceNorm(affine=True),
+            # 参数数量一致(2*C), 旧 GroupNorm checkpoint 可直接续训。
+            if self.dim == '2d':
+                self.norm = nn.InstanceNorm2d(
+                    num_features=in_channels,
+                    affine=True,
+                )
+            else:
+                self.norm = nn.InstanceNorm3d(
+                    num_features=in_channels,
+                    affine=True,
                 )
         elif norm_type=='layer':
             self.norm = LayerNorm(

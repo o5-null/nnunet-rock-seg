@@ -152,7 +152,9 @@ class LightMUNet(nn.Module):
         out_channels: int = 2,
         dropout_prob: float | None = None,
         act: tuple | str = ("RELU", {"inplace": True}),
-        norm: tuple | str = ("GROUP", {"num_groups": 8}),
+        # V100(sm_70) 兼容: torch 2.7 cu128 的 GroupNorm CUDA kernel 不兼容 V100
+        # (报 operation not supported on global/shared address space), 统一用 INSTANCE。
+        norm: tuple | str = ("INSTANCE", {"affine": True}),
         norm_name: str = "",
         num_groups: int = 8,
         use_conv_final: bool = True,
@@ -176,7 +178,8 @@ class LightMUNet(nn.Module):
         if norm_name:
             if norm_name.lower() != "group":
                 raise ValueError(f"Deprecating option 'norm_name={norm_name}', please use 'norm' instead.")
-            norm = ("group", {"num_groups": num_groups})
+            # V100 兼容: 历史 norm_name="group" 映射到 INSTANCE(GroupNorm kernel 不兼容 V100)
+            norm = ("instance", {"affine": True})
         self.norm = norm
         self.upsample_mode = UpsampleMode(upsample_mode)
         self.use_conv_final = use_conv_final
