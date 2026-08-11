@@ -99,7 +99,14 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
         try:
             import pynvml
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(self.local_rank)
+            # 对齐基类 GPU monitor: NVML index 是物理 GPU 序号，local_rank 是逻辑索引
+            # （-gpu 0,5,6,7 时 rank1 绑定 GPU5，但 local_rank=1 会让 NVML 读到物理
+            #  GPU1=llama 的卡，探测显存预算全错）。用基类的物理索引映射。
+            try:
+                phys_idx = self._get_physical_gpu_index()
+            except Exception:
+                phys_idx = self.local_rank
+            handle = pynvml.nvmlDeviceGetHandleByIndex(phys_idx)
             info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             # 功耗上限（TDP），部分卡不支持查询 → 默认 None（退化处理）
             power_limit_w = None
@@ -785,8 +792,19 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
                         f"iters/epoch={self.num_iterations_per_epoch} "
                         f"(saved {cache.get('timestamp', '?')})")
 
-            if new_bs is None:
-                # 无缓存/缓存失效/force → 真实探测
+            # DDP 下同步探测决策: 任何 rank 缓存失效 → 所有 rank 一起重新探测。
+            # 否则 MISS 的 rank 进入 _probe_batch_size 的 barrier，而 HIT 的 rank
+            # 直接跳过 → barrier 等不到 → 死锁（2026-08-11 4 卡混合 cache 实锤）。
+            need_probe = new_bs is None
+            if self.is_ddp:
+                _need_t = torch.tensor([1 if need_probe else 0], device=self.device)
+                dist.all_reduce(_need_t, op=dist.ReduceOp.MAX)
+                need_probe = bool(_need_t.item())
+                if need_probe and new_bs is not None:
+                    self.print_to_log_file(
+                        "[BatchProbe] peer rank cache MISS — forcing re-probe on all ranks (DDP sync)")
+            if need_probe:
+                # 无缓存/缓存失效/force/peer MISS → 全 rank 统一真实探测
                 new_bs = self._probe_batch_size()
                 # 探测结果写缓存（含指纹）
                 self._save_probe_cache({

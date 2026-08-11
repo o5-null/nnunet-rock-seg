@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import socket
 import sys
+import datetime
 from typing import Union, Optional, List
 
 # === Default environment optimizations for RTX 3080 (Ampere) ===
@@ -97,8 +98,11 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
 
 
 def setup_ddp(rank, world_size):
-    # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # 初始化进程组并设置 NCCL 超时: 探测/DDP 一旦死锁（如 collective 错位），
+    # NCCL watchdog 超时后自动 abort 进程，避免 rank 无限阻塞导致 Ctrl+C 也无法
+    # 终止（SIGINT 的 KeyboardInterrupt 要等 CUDA 调用返回，而 NCCL 死等 peer）。
+    dist.init_process_group("nccl", rank=rank, world_size=world_size,
+                            timeout=datetime.timedelta(minutes=3))
 
 
 def cleanup_ddp():
