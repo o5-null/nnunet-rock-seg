@@ -1082,6 +1082,26 @@ class nnUNetTrainer(object):
                                          folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
         return dataset_tr, dataset_val
 
+    def _use_pin_memory(self) -> bool:
+        """CUDA 训练时默认启用 pinned memory 加速 H2D 拷贝。
+
+        CUDAGraphMixin 会重载为 False：CUDA Graph 捕获期间 batchgenerators 的
+        pin_memory 线程调用 cudaHostRegister 会触发 "operation not permitted
+        when stream is capturing"（Blackwell / torch 2.10 实测），导致 worker
+        线程崩溃、捕获失败后连 eager 兜底都无法继续。故 CUDAGraph 训练器关闭。
+        """
+        return self.device.type == 'cuda'
+
+    def get_val_batch_size(self):
+        """验证 dataloader 的 batch size。默认与训练 batch 相同。
+
+        子类（如 CUDAGraphMixin）可 override 为更小的独立值：CUDA Graph 捕获
+        后其私有池锁定了大 batch 的训练激活，验证若仍用大 batch 会与锁定激活
+        叠加溢出（WDDM 下静默 swap 断崖降速）。缩小验证 batch 让验证 forward
+        激活装进剩余显存，同时避免每 epoch 释放+重捕获 graph 的开销。
+        """
+        return self.batch_size
+
     def get_dataloaders(self):
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
@@ -1127,7 +1147,7 @@ class nnUNetTrainer(object):
                                  oversample_foreground_percent=self.oversample_foreground_percent,
                                  sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
-        dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
+        dl_val = nnUNetDataLoader(dataset_val, self.get_val_batch_size(),
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
@@ -1144,11 +1164,11 @@ class nnUNetTrainer(object):
             mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
                                                         num_processes=allowed_num_processes,
                                                         num_cached=allowed_num_processes, seeds=None,
-                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
+                                                        pin_memory=self._use_pin_memory(), wait_time=0.002)
             mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
                                                       transform=None, num_processes=max(1, allowed_num_processes // 2),
                                                       num_cached=max(3, allowed_num_processes // 2), seeds=None,
-                                                      pin_memory=self.device.type == 'cuda',
+                                                      pin_memory=self._use_pin_memory(),
                                                       wait_time=0.002)
         # Train augmenter must be ready before training starts → start synchronously.
         # Val augmenter is only needed at epoch end → start in background thread to
@@ -1620,6 +1640,12 @@ class nnUNetTrainer(object):
         self.logger.log('precision_per_class', list(prec_pc), self.current_epoch)
         self.logger.log('recall_per_class', list(rec_pc), self.current_epoch)
         self.logger.log('specificity_per_class', list(spec_pc), self.current_epoch)
+
+        # 验证完成后释放验证阶段占用的显存（batch 验证 forward 的激活/work 区）。
+        # 验证是 eager forward，若不释放，缓存分配器的预留量会逐 epoch 只增不减
+        # （尤其叠加 CUDA Graph 私有池时），最终撑爆物理显存。这里统一归还，
+        # 对普通训练器无副作用（empty_cache 只释放空闲块）。
+        empty_cache(self.device)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)

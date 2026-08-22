@@ -34,6 +34,8 @@ Capture strategy: lazy capture on the FIRST train_step call, using the real
 batch's shapes to build static buffers (guarantees shapes match the dataloader
 exactly, including deep-supervision target lists). Subsequent steps replay.
 """
+import gc
+
 import torch
 from torch.amp import autocast
 
@@ -41,6 +43,33 @@ from torch.amp import autocast
 class nnUNetTrainerCUDAGraphMixin:
     # Set to False in a subclass to disable CUDA Graphs (for eager baselines).
     use_cuda_graphs = True
+    # 验证独立小 batch（None = 用训练 batch）。CUDA Graph 私有池锁定大 batch
+    # 训练激活后，验证若仍用大 batch 会与锁定激活叠加溢出（WDDM 静默 swap
+    # 断崖降速）。缩小验证 batch 让验证 forward 激活装进剩余显存，零重捕获
+    # 开销。这是默认方案（方案 D）。
+    val_batch_size = 8
+    # 重型网络训练器集中登记表（batch=4 训练显存实测 ≥ ~4G 者）:
+    # M2Net ~9G / SSND2Net ~14G / LightMamba2Net ~6G / LM2Net ~5.5G /
+    # SwT2Net ~5G / UNETR2Net ~4G。新增重型训练器只需把类名加入此集合，
+    # 无需在每个训练器文件里重复标记（get_val_batch_size 按类名自动检测）。
+    HEAVY_MODEL_TRAINERS = frozenset({
+        'nnUNetTrainerM2NetBatchProbeCUDAGraph',
+        'nnUNetTrainerSSND2NetBatchProbeCUDAGraph',
+        'nnUNetTrainerLightMamba2NetBatchProbeCUDAGraph',
+        'nnUNetTrainerLightMamba2NetCUDAGraph',
+        'nnUNetTrainerLM2NetBatchProbeCUDAGraph',
+        'nnUNetTrainerSwT2NetBatchProbeCUDAGraph',
+        'nnUNetTrainerUNETR2NetBatchProbeCUDAGraph',
+    })
+    # 显式标记: True/False 覆盖自动检测；None（默认）→ 按 HEAVY_MODEL_TRAINERS
+    # 类名自动判定。重型时验证 batch 自动减半（默认 8 → 4），避免验证 eager
+    # forward 叠加在锁定的 CUDA Graph 私有池上把峰值推过物理显存。
+    heavy_model = None
+    # 验证前是否释放 graph 以腾显存（方案 E，备选）。默认关闭——释放后下一
+    # 个 train_step 需重新捕获，warmup 会重跑 cuDNN autotune（SegResNet 实测
+    # 每 epoch ~78s，比训练本身还慢），故默认走 val_batch_size 小 batch 方案。
+    # 若需大验证 batch 且接受重捕获开销，子类可置 True 并设 val_batch_size=None。
+    release_graph_for_validation = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -117,6 +146,51 @@ class nnUNetTrainerCUDAGraphMixin:
         纯净性，且部分 Mamba/SSM 网络在 dynamo 下崩溃）。CUDAGraph 训练器统一禁用。
         """
         return False
+
+    def _use_pin_memory(self) -> bool:
+        """CUDAGraph 训练器关闭 pinned memory。
+
+        batchgenerators 的 pin_memory 在独立线程里调用 cudaHostRegister，
+        CUDA Graph 捕获期间该操作属于被禁止的 stream 操作，会报
+        "operation not permitted when stream is capturing" 并杀死 dataloader
+        worker 线程（Blackwell / torch 2.10 实测）。关闭后 worker 只做 CPU
+        增广与 H2D 拷贝，不再与捕获冲突。
+        """
+        return False
+
+    def get_val_batch_size(self):
+        """验证 batch 用独立小值（val_batch_size），默认 8。
+
+        验证 forward 激活 ≈ 训练 forward 激活 × (val_batch / train_batch)，
+        batch=8 时缩小 8 倍，装进 graph 锁定后剩余显存，避免叠加溢出。
+        返回 None 配置时回退到训练 batch（配合 release_graph_for_validation）。
+        重型网络（heavy_model=True）时再减半（8 → 4），进一步压低验证峰值。
+        """
+        vb = getattr(self, 'val_batch_size', None)
+        if vb is None:
+            return self.batch_size
+        heavy = getattr(self, 'heavy_model', None)
+        if heavy is None:
+            # 未显式标记 → 用集中登记表按类名自动检测（减少每文件重复标记）
+            heavy = type(self).__name__ in type(self).HEAVY_MODEL_TRAINERS
+        if heavy:
+            vb = max(1, vb // 2)
+            self.print_to_log_file(
+                f"[CUDAGraph] heavy_model=True — val_batch_size halved to {vb}")
+        return vb
+
+    def get_dataloaders(self):
+        """验证 batch 缩小时按比例放大验证迭代数，保持每 epoch 验证图数恒定
+        （nnUNet 默认 50 步 × 训练 batch），保证 fake dice 的统计口径跨训练器可比。
+        """
+        vb = self.get_val_batch_size()
+        if vb != self.batch_size:
+            self.num_val_iterations_per_epoch = max(
+                1, -(-self.num_val_iterations_per_epoch * self.batch_size // vb))
+            self.print_to_log_file(
+                f"[CUDAGraph] val_batch_size={vb} (train batch={self.batch_size}) — "
+                f"num_val_iterations_per_epoch={self.num_val_iterations_per_epoch}")
+        return super().get_dataloaders()
 
     def _copy_into_static(self, data: torch.Tensor, target):
         """Copy real batch into static buffers (non_blocking, no sync)."""
@@ -216,3 +290,42 @@ class nnUNetTrainerCUDAGraphMixin:
         self._graph_optimizer_step()
 
         self.print_to_log_file("CUDA Graphs: capture complete, replay mode on.")
+
+    # ------------------------------------------------------------------ #
+    #  Validation: release graph to free VRAM, re-capture on next train   #
+    # ------------------------------------------------------------------ #
+    def on_validation_epoch_start(self):
+        """验证前释放训练 CUDA Graph 以腾出显存。
+
+        CUDA Graph 的私有内存池锁定了大 batch 的 forward+backward 全部中间
+        激活（graph 不销毁不释放）。验证阶段是 eager forward，若不清空 graph，
+        验证激活会与锁定激活叠加，在 16GB 卡上溢出到共享显存导致断崖降速。
+        验证只需权重 + forward 激活，释放 graph 后普通池有足够空间。
+        下一个 train_step 因 _capture_attempted=False 会自动重新捕获。
+        """
+        if getattr(self, 'release_graph_for_validation', True):
+            self._release_cuda_graph()
+        super().on_validation_epoch_start()
+
+    def _release_cuda_graph(self):
+        """销毁训练 graph 及其静态 buffer，释放私有池 + 普通池缓存块。
+
+        顺序：先同步（确保最后一次 replay 完成，避免 pending kernel 引用
+        graph），再置 None 触发 CUDAGraph.__del__ 释放私有池，gc.collect 兜底
+        （确保 __del__ 被执行），empty_cache 归还普通池 free 块，最后同步
+        确保释放完成。
+        """
+        if self.cuda_graph is None:
+            return
+        self.print_to_log_file(
+            "CUDA Graphs: releasing graph before validation "
+            "(free VRAM for val forward; re-capture on next train step)")
+        torch.cuda.synchronize(self.device)
+        self.cuda_graph = None
+        self.static_input = None
+        self.static_target = None
+        self.static_loss = None
+        self._capture_attempted = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(self.device)

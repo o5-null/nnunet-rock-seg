@@ -123,8 +123,9 @@ class nnUNetTrainerSwinUNETR(nnUNetTrainer_MedNeXtBase):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad(set_to_none=True)
-
+        # 验证在 torch.no_grad() 下运行，无需 zero_grad；原 zero_grad(set_to_none=True)
+        # 会把 param.grad 置 None，破坏 CUDAGraphMixin replay 锁定的梯度地址，
+        # 导致下一轮训练 GradScaler 报 "No inf checks were recorded"。
         output = self.network(data)
         del data
         l = self.loss(output, target)

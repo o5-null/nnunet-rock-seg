@@ -106,7 +106,11 @@ class nnUNetTrainerSegResNet(nnUNetTrainer_MedNeXtBase):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad(set_to_none=True)
+        # 注意: 验证在 torch.no_grad() 下运行（run_training 包裹），forward 不产生
+        # 梯度，无需 zero_grad。原先的 zero_grad(set_to_none=True) 会把 param.grad
+        # 置 None，破坏 CUDAGraphMixin 重放路径锁定的梯度地址（replay 的
+        # zero_grad(set_to_none=False) 对 None 跳过），导致下一轮训练 GradScaler
+        # 报 "No inf checks were recorded"。
 
         # Autocast is a little bitch.
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.

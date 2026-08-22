@@ -27,5 +27,8 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainerLM2Net import nnUNetTrainerLM2
 
 
 class nnUNetTrainerLM2NetBatchProbeCUDAGraph(nnUNetTrainerBatchProbeCUDAGraph, nnUNetTrainerLM2Net):
-    """nnUNetTrainerLM2Net + 自动 batch 探测 + CUDA Graph 累积加速。"""
+    """nnUNetTrainerLM2Net + 自动 batch 探测 + CUDA Graph 累积加速。
+
+    重型（batch=4 ~5.5G）——验证 batch 减半由基类自动处理。
+    """
     pass
