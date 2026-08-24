@@ -55,5 +55,5 @@ class nnUNetTrainerLightSS2DMambaUNet(nnUNetTrainer_MedNeXtBase):
         model.apply(InitWeights_He(1e-2))
         model.apply(init_last_bn_before_add_to_0)
 
-        print(f"LightSS2DMambaUNet: {model}")
+        print(f"LightSS2DMambaUNet built. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         return model

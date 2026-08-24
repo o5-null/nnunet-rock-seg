@@ -24,8 +24,36 @@ MRO: [T, BatchProbeCUDAGraph, CUDAGraphMixin, BatchProbe, nnUNetTrainerSAMed, ..
 """
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainerBatchProbeCUDAGraph import nnUNetTrainerBatchProbeCUDAGraph
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainerSAMed import nnUNetTrainerSAMed
+import torch
 
 
 class nnUNetTrainerSAMedBatchProbeCUDAGraph(nnUNetTrainerBatchProbeCUDAGraph, nnUNetTrainerSAMed):
     """nnUNetTrainerSAMed + 自动 batch 探测 + CUDA Graph 累积加速。"""
-    pass
+    # SAMed 是固定预训练骨干 + dict 输出（{'low_res_logits','masks',...}），
+    # 与通用 BatchProbe/CUDAGraph 的 train_step（裸 forward(x) + self.loss(output,target)）
+    # 不兼容（output 为 dict，且 SAMed 需 forward(data, True, patch_size)）。
+    # 训练步直接委托给 SAMed 自己的 eager train_step（含 grad scaler + clip）。
+    # 注意: 因此 SAMed 路径不启用 CUDA Graph replay 与梯度累积（accum 被忽略）。
+    train_step = nnUNetTrainerSAMed.train_step
+
+    def _probe_trial(self, batch: int, patch):
+        """SAMed 探测: forward 返回 dict，loss 需取 low_res_logits 且 target 为低分辨率。
+
+        基类 BatchProbe._probe_trial 假设网络输出为 tensor/list（deep supervision），
+        SAMed 输出 dict 且 loss 期望 (low_res_logits, (B,1,h,w))，故单独实现。
+        """
+        net = getattr(self, '_probe_net', self.network)
+        num_output_channels = self.label_manager.num_segmentation_heads
+        dummy_batch = torch.randn(
+            (batch, self.num_input_channels, *patch), device=self.device)
+        with torch.autocast(self.device.type, dtype=self.autocast_dtype,
+                            enabled=self.device.type == 'cuda'):
+            output = net(dummy_batch, True, self.patch_size)
+            low_res = output['low_res_logits']  # (B, C, h, w)
+            dummy_target = torch.randint(
+                0, max(1, num_output_channels), (batch, 1, *low_res.shape[2:]),
+                device=self.device, dtype=torch.long)
+            l = self.loss(low_res, dummy_target)
+        l.backward()
+        # 不 step，仅测量; zero_grad 释放梯度供下一档复用
+        self.optimizer.zero_grad(set_to_none=True)

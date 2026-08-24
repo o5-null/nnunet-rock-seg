@@ -59,5 +59,5 @@ class nnUNetTrainerSwinTransformerUnet(nnUNetTrainer_MedNeXtBase):
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
         )
 
-        print(f"SwinTransformerUnet: {model}")
+        print(f"SwinTransformerUnet built. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         return model

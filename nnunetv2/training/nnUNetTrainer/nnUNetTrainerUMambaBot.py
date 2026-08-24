@@ -54,7 +54,7 @@ class nnUNetTrainerUMambaBot(nnUNetTrainer_MedNeXtBase):
                                           num_input_channels, num_output_channels,
                                           deep_supervision=enable_deep_supervision)
 
-        print("UMambaBot: {}".format(model))
+        print(f"UMambaBot built. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
         return model
 

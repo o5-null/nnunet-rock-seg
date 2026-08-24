@@ -302,13 +302,17 @@ class SSND(nn.Module):
         return y
 
     def forward(self, x: torch.Tensor):
+        # 稳定输入 dtype，避免 Dynamo 因 AMP 切换 fp16/fp32 反复重编译
+        # 并保证后续 SSM 投影/einsum 在 fp32 下计算，防止 fp16 溢出 → NaN
+        # 对齐 LightSS2DMambaUNet.MambaLayer.forward 的稳定 fp32 方案 (#314)
+        x = x.float()
         xz = self.in_proj(x)
         x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
 
         x = permute(x, self.spatial_dims, reverse=True).contiguous()
         x = self.act(self.convnd(x))  # (b, d, h, w)
         y = self.forward_core(x)
-        # assert y1.dtype == torch.float32
+        assert y.dtype == torch.float32, f"SSND.forward_core must return float32, got {y.dtype}"
 
         y = self.out_norm(y)
         y = y * F.silu(z)

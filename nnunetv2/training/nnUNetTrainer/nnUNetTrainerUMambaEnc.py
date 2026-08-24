@@ -30,6 +30,6 @@ class nnUNetTrainerUMambaEnc(nnUNetTrainer_MedNeXtBase):
                                           num_input_channels, num_output_channels,
                                           deep_supervision=enable_deep_supervision)
 
-        print("UMambaEnc: {}".format(model))
+        print(f"UMambaEnc built. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
         return model

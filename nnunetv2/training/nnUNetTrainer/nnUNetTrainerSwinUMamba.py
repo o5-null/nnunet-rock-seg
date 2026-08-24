@@ -58,5 +58,5 @@ class nnUNetTrainerSwinUMamba(nnUNetTrainer_MedNeXtBase):
             use_pretrain=False,
         )
 
-        print(f"SwinUMamba: {model}")
+        print(f"SwinUMamba built. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         return model

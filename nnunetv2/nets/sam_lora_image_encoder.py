@@ -192,8 +192,20 @@ class LoRA_Sam(nn.Module):
         for w_B in self.w_Bs:
             nn.init.zeros_(w_B.weight)
 
-    def forward(self, batched_input, multimask_output, image_size):
-        return self.sam(batched_input, multimask_output, image_size)
+    def forward(self, batched_input, multimask_output=False, image_size=None):
+        # 默认参数: BatchProbe 探测 / 基类 kernel warmup 以裸 forward(x) 测显存，
+        # 需可不传额外参数。
+        # image_size 缺省取构建时 SAM 的 img_size，保证探测显存与真实训练一致
+        #（探测外推按 per-sample 显存线性估算，尺寸不一致会失真）。
+        if image_size is None:
+            image_size = self.sam.image_encoder.img_size
+        out = self.sam(batched_input, multimask_output, image_size)
+        # 裸调用（探测/warmup，multimask_output=False）期望返回 tensor（与 U-Net 系一致），
+        # 供基类 _warmup_kernels 读 num_output_channels / 计算 warmup loss；
+        # 训练/验证走 multimask_output=True 返回完整 dict。
+        if not multimask_output:
+            return out['masks']
+        return out
 
 
     # def forward(self, x: Tensor) -> Tensor:

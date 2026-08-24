@@ -76,5 +76,5 @@ class nnUNetTrainerSSND2Net(nnUNetTrainer_MedNeXtBase):
         model.apply(InitWeights_He(1e-2))
         model.apply(init_last_bn_before_add_to_0)
 
-        print(f"SSND2Net: {model}")
+        print(f"SSND2Net built. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         return model
