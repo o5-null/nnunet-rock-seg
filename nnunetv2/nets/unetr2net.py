@@ -1432,6 +1432,14 @@ class UNETR(nn.Module):
             qkv_bias=qkv_bias,
             save_attn=save_attn,
         )
+        # MONAI TransformerBlock 无条件注册 norm_cross_attn 参数，但本项目 ViT
+        # 从不传 context（with_cross_attention=False），这两个参数永不参与前向。
+        # DDP 要求所有参数收到梯度，否则报 "Expected to have finished reduction"。
+        # 冻结死参数（DDP 自动忽略 requires_grad=False），避免 find_unused_parameters 开销。
+        for blk in self.vit.blocks:
+            if hasattr(blk, 'norm_cross_attn'):
+                for p in blk.norm_cross_attn.parameters():
+                    p.requires_grad = False
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
             in_channels=in_channels,

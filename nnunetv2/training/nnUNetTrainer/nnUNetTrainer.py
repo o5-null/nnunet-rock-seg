@@ -295,7 +295,13 @@ class nnUNetTrainer(object):
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
-                self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+                if self._use_sync_batchnorm():
+                    self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+                    self.print_to_log_file("DDP: using SyncBatchNorm (cross-rank BN statistics)")
+                else:
+                    self.print_to_log_file(
+                        f"DDP: using plain BN (per-rank statistics, batch={self.configuration_manager.batch_size})"
+                        " — SyncBN disabled")
                 # device_ids 必须与模型实际所在 GPU 一致（self.device.index）:
                 # 用 local_rank 在 -gpu 0,5,6,7 场景会错位（模型在 cuda:7 而
                 # DDP 假定 cuda:2 → warmup forward 报 device mismatch，
@@ -480,6 +486,24 @@ class nnUNetTrainer(object):
             return True
         else:
             return os.environ['nnUNet_compile'].lower() in ('true', '1', 't')
+
+    def _use_sync_batchnorm(self) -> bool:
+        """DDP 下是否把 BN 换成 SyncBatchNorm。
+
+        默认开启（与上游 nnU-Net 一致），可用环境变量 `nnUNet_sync_bn`
+        覆盖（'0'/'false'/'no'/'off' 关闭）。
+
+        SyncBatchNorm 每层 forward 都要把各 rank 的 count/mean/var gather
+        回来做数据相关的布尔索引（`count_all[count_all >= 1]`），这个
+        `aten::nonzero` 会强制一次 GPU→CPU 同步，把前向流水打断成
+        「每层一个气泡」。更严重的是它会阻止 CUDA Graph 捕获
+        （pytorch/pytorch#78549 在 torch 源码里有明确注释）。当每卡
+        batch 足够大（≥8）时，普通 BN 的统计量已经足够稳，关掉更划算。
+        """
+        val = os.environ.get('nnUNet_sync_bn', None)
+        if val is None:
+            return True
+        return val.strip().lower() in ('true', '1', 't', 'yes', 'on')
 
     def _save_debug_information(self):
         # saving some debug information
