@@ -490,15 +490,20 @@ class nnUNetTrainer(object):
     def _use_sync_batchnorm(self) -> bool:
         """DDP 下是否把 BN 换成 SyncBatchNorm。
 
-        默认开启（与上游 nnU-Net 一致），可用环境变量 `nnUNet_sync_bn`
-        覆盖（'0'/'false'/'no'/'off' 关闭）。
+        默认开启（与上游 nnU-Net 一致）；设置环境变量 `nnUNet_sync_bn` 可覆盖：
+        真值（'1'/'true'/'t'/'yes'/'on'）开启，假值（'0'/'false'/'no'/'off'）关闭。
 
-        SyncBatchNorm 每层 forward 都要把各 rank 的 count/mean/var gather
-        回来做数据相关的布尔索引（`count_all[count_all >= 1]`），这个
-        `aten::nonzero` 会强制一次 GPU→CPU 同步，把前向流水打断成
-        「每层一个气泡」。更严重的是它会阻止 CUDA Graph 捕获
-        （pytorch/pytorch#78549 在 torch 源码里有明确注释）。当每卡
-        batch 足够大（≥8）时，普通 BN 的统计量已经足够稳，关掉更划算。
+        关闭的理由（性能）:
+        SyncBatchNorm 每层 forward 都要把各 rank 的 count/mean/var gather 回来做
+        数据相关的布尔索引（`count_all[count_all >= 1]`），这个 `aten::nonzero`
+        会强制一次 GPU→CPU 同步，把前向流水打断成「每层一个气泡」；torch 源码亦
+        注明 SyncBatchNorm 与 CUDA Graph capture 不兼容。每卡 batch ≥8 时普通 BN
+        的统计量已足够稳，关闭更划算。
+
+        关闭的代价（语义，务必知悉）:
+        普通 BN 的 running_mean/var 是**每个 rank 各自累积、不跨卡同步**的，而
+        SyncBN 是全局统计。checkpoint 保存的是 rank0 的统计量，因此关闭后推理时
+        的归一化与 SyncBN 训练结果存在细微差异（每卡 batch 越大差异越小）。
         """
         val = os.environ.get('nnUNet_sync_bn', None)
         if val is None:
