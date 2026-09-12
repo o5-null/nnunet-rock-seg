@@ -95,13 +95,17 @@ class nnUNetTrainerCUDAGraphMixin:
         else:
             target = batch['target'].to(self.device, non_blocking=True)
 
-        accum = getattr(self, 'grad_accum_steps', 1)
+        # accum 下限保护：accum<=0 会让边界判定退化成"每步都是边界"，独立
+        # BatchProbe 的 `counter % accum` 更会直接除零。
+        accum = max(1, getattr(self, 'grad_accum_steps', 1))
         # 累积边界判定只在此处递增一次计数器，结果经 _accum_boundary 传给内层
         # train_step（BatchProbe）。历史问题：mixin 与 BatchProbe 各自递增同一个
         # _accum_step_counter，计数器被双递增 → BatchProbe 每步都看到偶数 →
         # is_accum_boundary 恒 True → 梯度累积完全失效（每步都 all-reduce 全部
         # 梯度 + optimizer.step，no_sync 一次不用）。内层改为只读 token 后
         # accum>1 才真正生效。
+        # 规则（本项目唯一实现；BatchProbe 独立使用处逐字对齐，勿只改一边）：
+        # 计数到 accum 归零并标记边界。
         self._accum_step_counter += 1
         if self._accum_step_counter >= accum:
             self._accum_step_counter = 0

@@ -432,14 +432,12 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
                 bn = bn_cls(mod.num_features, eps=mod.eps,
                             momentum=mod.momentum, affine=mod.affine,
                             track_running_stats=mod.track_running_stats)
-                # 设备/精度跟随被替换的 SyncBN: torch 默认设备此时通常是 CPU
-                # （网络是显式 .to(device) 迁移的），新建 BN 若留在 CPU，
-                # 探测 forward 会报 "weight is on cpu, different from other
-                # tensors on cuda:N"。affine=False 时无 weight，退回参考
-                # running_mean（同样已随网络迁移）
+                # 设备/精度跟随被替换的 SyncBN（理由见本方法 docstring）。
+                # affine=False 时无 weight，退回 running_mean 作参考。
+                # Module.to 原地生效，无需接返回值。
                 ref = mod.weight if mod.weight is not None else mod.running_mean
                 if ref is not None:
-                    bn = bn.to(device=ref.device, dtype=ref.dtype)
+                    bn.to(device=ref.device, dtype=ref.dtype)
                 if mod.affine:
                     bn.weight.data.copy_(mod.weight.data)
                     bn.bias.data.copy_(mod.bias.data)
@@ -664,16 +662,23 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        accum = getattr(self, 'grad_accum_steps', 1)
+        # accum 下限保护（同 CUDAGraphMixin.train_step 同名注释）。
+        accum = max(1, getattr(self, 'grad_accum_steps', 1))
         # 边界判定来源：被 CUDAGraphMixin.train_step 包裹时（CUDAGraph 系列训练器）
         # 该 mixin 已为本 iteration 递增并复位计数器，这里只读 token，绝不重复
         # 递增——两层同时递增会使计数器被双递增，导致 accum>1 时每步都判为边界、
         # 梯度累积失效（2026-09-11 定位并修复）。独立使用 BatchProbe 时 token 不
         # 存在（None），自行维护计数器。
+        # 规则与 CUDAGraphMixin.train_step 逐字一致（计数到 accum 归零并标记边界），
+        # 两处必须同步修改。
         boundary_token = getattr(self, '_accum_boundary', None)
         if boundary_token is None:
             self._accum_step_counter = getattr(self, '_accum_step_counter', 0) + 1
-            is_accum_boundary = (self._accum_step_counter % accum == 0)
+            if self._accum_step_counter >= accum:
+                self._accum_step_counter = 0
+                is_accum_boundary = True
+            else:
+                is_accum_boundary = False
         else:
             is_accum_boundary = boundary_token
 
