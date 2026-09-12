@@ -1433,13 +1433,26 @@ class UNETR(nn.Module):
             save_attn=save_attn,
         )
         # MONAI TransformerBlock 无条件注册 norm_cross_attn 参数，但本项目 ViT
-        # 从不传 context（with_cross_attention=False），这两个参数永不参与前向。
+        # 从不传 context（with_cross_attention=False），该参数永不参与前向。
         # DDP 要求所有参数收到梯度，否则报 "Expected to have finished reduction"。
         # 冻结死参数（DDP 自动忽略 requires_grad=False），避免 find_unused_parameters 开销。
+        frozen = 0
         for blk in self.vit.blocks:
-            if hasattr(blk, 'norm_cross_attn'):
-                for p in blk.norm_cross_attn.parameters():
-                    p.requires_grad = False
+            norm_cross = getattr(blk, 'norm_cross_attn', None)
+            if norm_cross is None:
+                continue
+            for p in norm_cross.parameters():
+                p.requires_grad = False
+                frozen += 1
+        if frozen == 0:
+            # 静默失效防护：MONAI 一旦重命名 ViT.blocks / TransformerBlock.norm_cross_attn，
+            # 上面的循环会什么都不做，DDP 直到 backward 才报 "Expected to have finished
+            # reduction"，且完全看不出是这里。显式告警。
+            warnings.warn(
+                f"{type(self).__name__}: 未冻结任何 norm_cross_attn 参数 —— MONAI 可能已重命名 "
+                "ViT.blocks / TransformerBlock.norm_cross_attn。用 DDP 训练时请确认该 ViT 是否"
+                "仍注册了不参与前向的死参数，否则会报 'Expected to have finished reduction'。",
+                RuntimeWarning, stacklevel=2)
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
             in_channels=in_channels,
