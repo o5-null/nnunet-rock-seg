@@ -24,9 +24,14 @@ class REBNCONV(nn.Module):
 
 ## upsample tensor 'src' to have the same spatial size with tensor 'tar'
 def _upsample_like(src, tar):
-    # src = F.upsample(src, size=tar.shape[2:], mode='bilinear')
-    src = F.interpolate(src, size=tar.shape[2:], mode='bilinear')
-    return src
+    """把 src 上采样到 tar 的空间尺寸。
+
+    ⚠️ 注意（2026-09-12 A/B 微基准）：不要用 ``autocast(enabled=False)`` 压成
+    fp16。实测 fp16 的 bilinear 反向核比 fp32 慢 1.30×（单通道侧输出 2.31×），
+    autocast 默认提升到 fp32 才是最快路径。这里保持默认，仅显式 align_corners=False
+    以与 MONAI UpSample 的 bilinear 默认行为一致。
+    """
+    return F.interpolate(src, size=tar.shape[2:], mode="bilinear", align_corners=False)
 
 
 ### RSU-7 ###

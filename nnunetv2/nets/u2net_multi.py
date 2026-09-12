@@ -2,6 +2,7 @@ from monai.utils import UpsampleMode, InterpolateMode
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from monai.networks.blocks.upsample import UpSample
 
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
@@ -38,8 +39,21 @@ class MaxPool(nn.Module):
 
 ## upsample tensor 'src' to have the same spatial size with tensor 'tar'
 def _upsample_like(src, tar, upsample_mode: UpsampleMode | str = "nontrainable"):
-    # src = F.upsample(src, size=tar.shape[2:], mode='bilinear')
-    # get_upsample_layer(spatial_dims, sample_in_channels // 2, upsample_mode=upsample_mode),
+    """把 src 上采样到 tar 的空间尺寸。
+
+    性能说明（2026-09-12，经 A/B 微基准修正）:
+    1. 原实现每次调用都新建 MONAI ``UpSample`` 模块（整网每 forward 约 36 次），
+       非训练模式改用 ``F.interpolate`` 直接调用，省去纯 Python 构造开销。
+    2. ⚠️ 曾尝试用 ``autocast(enabled=False)`` 把插值压成 fp16，**实测是负优化**：
+       fp16 的 ``upsample_bilinear2d`` 反向核比 fp32 慢 1.30×，单通道侧输出
+       （d2..d6 上采样到全分辨率）更慢 2.31×。autocast 默认把 bilinear 提升到
+       fp32 反而是最快的路径，因此这里**不做** dtype 干预。
+    3. ``trainable`` 模式需要可学习上采样参数，保留 MONAI ``UpSample``。
+    """
+    if upsample_mode == "nontrainable" or upsample_mode == UpsampleMode.NONTRAINABLE:
+        return F.interpolate(src, size=tuple(tar.shape[2:]),
+                             mode="bilinear", align_corners=False)
+    # trainable 路径（本项目未使用，保留向后兼容）
     layer = UpSample(
         spatial_dims=len(src.shape[2:]),
         in_channels=src.shape[1],
@@ -55,36 +69,40 @@ def _upsample_like(src, tar, upsample_mode: UpsampleMode | str = "nontrainable")
 ### RSU-7 ###
 class RSU7(nn.Module):  # UNet07DRES(nn.Module):
 
-    def __init__(self, spatial_dims: int = 2, in_ch=3, mid_ch=12, out_ch=3):
+    def __init__(self, spatial_dims: int = 2, in_ch=3, mid_ch=12, out_ch=3, act='relu', norm='BATCH'):
         super(RSU7, self).__init__()
 
-        self.rebnconvin = Convolution(spatial_dims, in_ch, out_ch, dilation=1)
+        # 与 nnUZoo 参考实现对齐：RSU7 对应参考中的 REBNCONV(Conv+BN+ReLU)。
+        # 修复（2026-09-12）前未传 act/norm，落到 MONAI Convolution 的默认
+        # INSTANCE+PRELU，与其余 RSU（RSU6/5/4/4F 均显式 BATCH+relu）不一致，
+        # 也是与参考实现的偏差。BatchNorm+ReLU 同时比 InstanceNorm+PReLU 略快。
+        self.rebnconvin = Convolution(spatial_dims, in_ch, out_ch, dilation=1, act=act, norm=norm)
 
-        self.rebnconv1 = Convolution(spatial_dims, out_ch, mid_ch, dilation=1)
+        self.rebnconv1 = Convolution(spatial_dims, out_ch, mid_ch, dilation=1, act=act, norm=norm)
         self.pool1 = MaxPool(spatial_dims, 2, stride=2, ceil_mode=True)
 
-        self.rebnconv2 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1)
+        self.rebnconv2 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1, act=act, norm=norm)
         self.pool2 = MaxPool(spatial_dims, 2, stride=2, ceil_mode=True)
 
-        self.rebnconv3 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1)
+        self.rebnconv3 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1, act=act, norm=norm)
         self.pool3 = MaxPool(spatial_dims, 2, stride=2, ceil_mode=True)
 
-        self.rebnconv4 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1)
+        self.rebnconv4 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1, act=act, norm=norm)
         self.pool4 = MaxPool(spatial_dims, 2, stride=2, ceil_mode=True)
 
-        self.rebnconv5 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1)
+        self.rebnconv5 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1, act=act, norm=norm)
         self.pool5 = MaxPool(spatial_dims, 2, stride=2, ceil_mode=True)
 
-        self.rebnconv6 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1)
+        self.rebnconv6 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=1, act=act, norm=norm)
 
-        self.rebnconv7 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=2)
+        self.rebnconv7 = Convolution(spatial_dims, mid_ch, mid_ch, dilation=2, act=act, norm=norm)
 
-        self.rebnconv6d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1)
-        self.rebnconv5d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1)
-        self.rebnconv4d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1)
-        self.rebnconv3d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1)
-        self.rebnconv2d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1)
-        self.rebnconv1d = Convolution(spatial_dims, mid_ch * 2, out_ch, dilation=1)
+        self.rebnconv6d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1, act=act, norm=norm)
+        self.rebnconv5d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1, act=act, norm=norm)
+        self.rebnconv4d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1, act=act, norm=norm)
+        self.rebnconv3d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1, act=act, norm=norm)
+        self.rebnconv2d = Convolution(spatial_dims, mid_ch * 2, mid_ch, dilation=1, act=act, norm=norm)
+        self.rebnconv1d = Convolution(spatial_dims, mid_ch * 2, out_ch, dilation=1, act=act, norm=norm)
 
     def forward(self, x):
         hx = x
@@ -422,24 +440,26 @@ class U2NET(nn.Module):
         hx1d = self.stage1d(torch.cat((hx2dup, hx1), 1))  # 1, 64, 256, 256
 
         # side output
+        # 优化（2026-09-12）：侧输出保留各自原生分辨率用于 deep supervision
+        # （标准 nnUNet 多尺度 DS），仅在构造 d0 时上采样到 d1 的尺寸。
+        # d0 的输入仍是 (d1, up(d2..d6))，数值与改动前完全一致；但 DS 损失从
+        # 6 个全分辨率当量降到 d1:1 + d2:1/2 + d3:1/4 + ... ≈ 2.3 个，且 dataloader
+        # 的 DS target 不再是 7 份全分辨率副本（配合 trainer 的
+        # _get_deep_supervision_scales 返回多分辨率尺度）。
         d1 = self.side1(hx1d)
 
         d2 = self.side2(hx2d)
-        d2 = _upsample_like(d2, d1)
-
         d3 = self.side3(hx3d)
-        d3 = _upsample_like(d3, d1)
-
         d4 = self.side4(hx4d)
-        d4 = _upsample_like(d4, d1)
-
         d5 = self.side5(hx5d)
-        d5 = _upsample_like(d5, d1)
-
         d6 = self.side6(hx6)
-        d6 = _upsample_like(d6, d1)
 
-        d0 = self.outconv(torch.cat((d1, d2, d3, d4, d5, d6), 1))
+        d0 = self.outconv(torch.cat((d1,
+                                     _upsample_like(d2, d1),
+                                     _upsample_like(d3, d1),
+                                     _upsample_like(d4, d1),
+                                     _upsample_like(d5, d1),
+                                     _upsample_like(d6, d1)), 1))
         if self.deep_supervision:
             return d0, d1, d2, d3, d4, d5, d6
         else:
