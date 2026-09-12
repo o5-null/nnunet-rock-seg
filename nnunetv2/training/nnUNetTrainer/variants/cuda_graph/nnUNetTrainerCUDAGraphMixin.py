@@ -81,6 +81,8 @@ class nnUNetTrainerCUDAGraphMixin:
         # 梯度累积支持: 从宿主类继承 grad_accum_steps（BatchProbe 设置），
         # 无累积时默认为 1（行为与原始 mixin 完全一致）
         self._accum_step_counter = 0
+        # 本次 iteration 是否累积边界（由 train_step 计算，内层 BatchProbe 只读）
+        self._accum_boundary = True
 
     # ------------------------------------------------------------------ #
     #  Training step override: replay path + lazy capture on first call   #
@@ -94,8 +96,19 @@ class nnUNetTrainerCUDAGraphMixin:
             target = batch['target'].to(self.device, non_blocking=True)
 
         accum = getattr(self, 'grad_accum_steps', 1)
+        # 累积边界判定只在此处递增一次计数器，结果经 _accum_boundary 传给内层
+        # train_step（BatchProbe）。历史问题：mixin 与 BatchProbe 各自递增同一个
+        # _accum_step_counter，计数器被双递增 → BatchProbe 每步都看到偶数 →
+        # is_accum_boundary 恒 True → 梯度累积完全失效（每步都 all-reduce 全部
+        # 梯度 + optimizer.step，no_sync 一次不用）。内层改为只读 token 后
+        # accum>1 才真正生效。
         self._accum_step_counter += 1
-        is_boundary = (self._accum_step_counter % accum == 0) if accum > 1 else True
+        if self._accum_step_counter >= accum:
+            self._accum_step_counter = 0
+            self._accum_boundary = True
+        else:
+            self._accum_boundary = False
+        is_boundary = self._accum_boundary
 
         # --- Replay path (steady state) ---
         if self.cuda_graph is not None:
@@ -123,6 +136,10 @@ class nnUNetTrainerCUDAGraphMixin:
             self._capture_attempted = True
             try:
                 self._capture_cuda_graph(data, target)
+                # capture 自身已完成一次完整的 step（_graph_optimizer_step），
+                # 等同于一个累积边界 → 计数器归零，避免后续 replay 的累积相位错位。
+                self._accum_step_counter = 0
+                self._accum_boundary = True
                 # capture 已用真实数据完成一次完整训练步（forward+backward+step），
                 # 直接返回该 loss，不再重复 replay 同一 batch
                 return {'loss': self.static_loss.detach().cpu().numpy()}
