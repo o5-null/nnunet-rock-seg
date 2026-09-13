@@ -469,7 +469,8 @@ class REBNCONV(nn.Module):
 
 
 def _upsample_like(src, tar_shape):
-    src = F.upsample(src, size=tar_shape, mode='bilinear')
+    # F.upsample 已弃用(仅别名, 数值等价), 改用 F.interpolate 消除 UserWarning
+    src = F.interpolate(src, size=tar_shape, mode='bilinear')
 
     return src
 
