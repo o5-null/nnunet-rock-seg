@@ -43,6 +43,26 @@ class nnUNetTrainerBatchProbeCUDAGraph(nnUNetTrainerCUDAGraphMixin, nnUNetTraine
     第一个 train_step 用探测后的 batch shape 惰性捕获。
     """
 
+    # CUDA Graph 私有池的显存预留比例。探针只用 eager forward/backward 测显存，
+    # **测不到 graph 私有池**（该池由 torch.cuda.CUDAGraph 单独管理、不归 caching
+    # allocator 管）。若沿用 BatchProbe 基类 0.92 的物理显存安全阀选 batch，捕获
+    # 时整卡会被推到 100%，Windows WDDM 驱动不报 OOM 而是静默把 graph 池溢出到
+    # 共享内存 → 每次 replay 的激活走 PCIe，慢约 8×、功耗腰斩（2026-09-12 实测）。
+    # 此处从探测预算里预留 20% 物理显存给 graph 池 + 验证峰值，把安全阀收到 0.80。
+    GRAPH_POOL_VRAM_RESERVE_RATIO = 0.20
+
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, device: torch.device = torch.device('cuda')):
+        # 必须关键字传 device（同 BatchProbe.__init__，MRO 下一跳签名带 unpack_dataset）
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # BatchProbe.__init__ 里 vram_safe_ratio=0.92，此处收紧为 graph 池留余量
+        self.vram_safe_ratio = min(
+            self.vram_safe_ratio, 1.0 - self.GRAPH_POOL_VRAM_RESERVE_RATIO)
+        self.print_to_log_file(
+            f"[CUDAGraph] vram_safe_ratio tightened to "
+            f"{self.vram_safe_ratio:.2f} (reserve "
+            f"{self.GRAPH_POOL_VRAM_RESERVE_RATIO:.0%} for CUDA Graph private pool)")
+
     def _do_i_compile(self):
         """graph 路径统一禁用 compile（互斥）。注意此方法在探测前调用
         （initialize L277），此处恒返回 False 避免预 compile；若用户强制
