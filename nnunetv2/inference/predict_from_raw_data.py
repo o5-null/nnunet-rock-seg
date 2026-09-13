@@ -67,6 +67,8 @@ class nnUNetPredictor(object):
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
+        # 验证 forward CUDA Graph（由 enable_cuda_graph_forward 武装，见该类方法）
+        self._fwd_graph = None
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
@@ -175,6 +177,52 @@ class nnUNetPredictor(object):
         if allow_compile:
             print('Using torch.compile')
             self.network = torch.compile(self.network)
+
+    # ------------------------------------------------------------------ #
+    #  Validation forward CUDA Graph (验证推理加速)                         #
+    # ------------------------------------------------------------------ #
+    def enable_cuda_graph_forward(self, autocast_dtype: Optional[torch.dtype] = None,
+                                  spill_free_ratio: float = 0.02,
+                                  logger=None) -> bool:
+        """武装 network forward 的 CUDA Graph 捕获（验证推理加速）。
+
+        验证每张图要做 9 tile × 4 mirror TTA = 36 次前向，而该前向是 CPU
+        launch-bound（实测耗时与 batch 无关，bs1/2/4 均 ~0.35-0.40 s），捕获
+        成图后每次 replay 只发一次 launch。
+
+        图在第一次 forward 时才惰性捕获（那时才有真实 shape）。捕获前后做
+        warmup / 数值一致性 / 速度收益三重自检，任一不过即永久回退 eager——
+        绝不让验证算错或变慢。返回是否已武装（尚未捕获）。
+        """
+        if self.device.type != 'cuda' or self.network is None:
+            return False
+        from nnunetv2.inference.cuda_graph_forward import CudaGraphForward
+        self._fwd_graph = CudaGraphForward(
+            self.network, self.device,
+            autocast_dtype=autocast_dtype if autocast_dtype is not None else torch.float16,
+            spill_free_ratio=spill_free_ratio, logger=logger)
+        return True
+
+    def disable_cuda_graph_forward(self):
+        """卸载验证 CUDA Graph，后续 forward 全部走 eager。"""
+        if self._fwd_graph is not None:
+            self._fwd_graph.enabled = False
+            self._fwd_graph = None
+
+    def _forward_network(self, x: torch.Tensor) -> torch.Tensor:
+        """网络前向统一入口：已武装则走图 replay，否则 eager。
+
+        图返回的是 clone——静态输出缓冲会被下一次 replay 覆写，而调用方
+        (_internal_maybe_mirror_and_predict) 会对返回值做累加，必须解除别名。
+        """
+        g = self._fwd_graph
+        if g is None:
+            return self.network(x)
+        if g.net is not self.network:
+            # 网络对象被替换（compile / 重新 .to() 产生新对象）→ 图失效，弃用
+            self._fwd_graph = None
+            return self.network(x)
+        return g(x)
 
     @staticmethod
     def auto_detect_available_folds(model_training_output_dir, checkpoint_name):
@@ -638,7 +686,7 @@ class nnUNetPredictor(object):
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = self.network(x)
+        prediction = self._forward_network(x)
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
@@ -650,8 +698,12 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
-            prediction /= (len(axes_combinations) + 1)
+                # 非原地累加：graph 路径下 _forward_network 返回的是静态输出缓冲的
+                # clone，用 += 依赖该 clone 才安全。改成 out-of-place 后即便未来某实现
+                # 返回共享缓冲也不会静默写坏结果。
+                prediction = prediction + torch.flip(
+                    self._forward_network(torch.flip(x, axes)), axes)
+            prediction = prediction / (len(axes_combinations) + 1)
         return prediction
 
     @torch.inference_mode()
