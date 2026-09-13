@@ -740,6 +740,12 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
         return {
             'gpu_name': gpu_name,
             'vram_total_mb': vram_total_mb,
+            # 探测显存预算安全阀: 决定 batch 的核心参数，必须进指纹。
+            # 否则调整安全阀后旧缓存仍判 HIT，复用按旧阀探出的过大 batch
+            # （2026-09-12 实测: CUDAGraph 变体阀从 0.92 收到 0.80 为 graph
+            #  私有池预留 20%，但 9/1 旧缓存 batch=26 仍被复用 → 捕获时整卡
+            #  100%、WDDM 把 graph 池溢出到共享内存 → 回退 eager）。
+            'vram_safe_ratio': round(float(self.vram_safe_ratio), 4),
             'trainer_class': self.__class__.__name__,
             'dataset': self.dataset_json.get('dataset_name', ''),
             'fold': self.fold,
@@ -799,6 +805,33 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
                 f"(nominal was {self.nominal_batch_size})")
             self.batch_size = new_bs
 
+    def _reclaim_vram_after_probe(self):
+        """探测结束后把 allocator 的缓存/碎片归还驱动（关键收尾）。
+
+        二分搜索会在 caching allocator 里留下最高档（如 batch=19）的缓存块。
+        若不清空，这些块会一直驻留到训练期：
+          - 物理显存被白白占住（NVML used 下不来），
+          - 紧接着的 CUDA Graph 捕获需要新分配私有池，与残留叠加后整卡被推到
+            100%；Windows WDDM 驱动此时**不报 OOM**，而是静默把 graph 私有池
+            溢出到共享（host）内存 → 此后每次 replay 的激活都走 PCIe 而非
+            VRAM，慢约 8×、功耗腰斩、SM util 仍近 100%（2026-09-12 实测：
+            同一训练器探针 MISS 的跑 147W/2.68s per iter，缓存 HIT 的跑
+            266W/0.35s per iter）。
+        empty_cache() 只归还「已缓存但空闲」的块，不影响活跃张量，安全。
+        """
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(self.device)
+            reserved_mb = torch.cuda.memory_reserved(self.device) / 1024 ** 2
+            self.print_to_log_file(
+                f"[BatchProbe] VRAM reclaimed after probe "
+                f"(torch reserved now {reserved_mb:.0f}MB)")
+        except Exception as e:
+            # 回收失败不应中断训练
+            self.print_to_log_file(
+                f"[BatchProbe] VRAM reclaim after probe failed ({e})")
+
     # ------------------------------------------------------------------
     # 插入点: warmup 前探测（此时 network/optimizer/loss 就绪，
     # dataloader 未建；探测结果被 get_dataloaders 消费）
@@ -851,6 +884,8 @@ class nnUNetTrainerBatchProbe(nnUNetTrainer):
                     'grad_accum_steps': self.grad_accum_steps,
                     'num_iterations_per_epoch': self.num_iterations_per_epoch,
                 })
+                # 探测结束立即回收 allocator 残留（关键：见 _reclaim_vram_after_probe）
+                self._reclaim_vram_after_probe()
 
             self._apply_probe_result(new_bs)
             if self.probe_only:
