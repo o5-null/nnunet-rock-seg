@@ -30,5 +30,17 @@ class nnUNetTrainerSSND2NetBatchProbeCUDAGraph(nnUNetTrainerBatchProbeCUDAGraph,
     """nnUNetTrainerSSND2Net + 自动 batch 探测 + CUDA Graph 累积加速。
 
     重型（batch=4 ~14G，全项目最重）——验证 batch 减半由基类自动处理。
+
+    CUDA Graph 私有池显存预留覆盖（2026-09-13）:
+    基类为 graph 私有池保守预留 20% 物理显存（vram_safe_ratio → 0.80）。但对
+    SSND2Net 在 10GB RTX 3080 上**过于保守**：实测 batch=2 稳态物理占用
+    9015/10240MB = 88%，被 0.80 阀拒 → 探测塌到 actual_batch=1、accum=16、
+    功耗仅 74W/320W（GPU 被饿着跑）。而 2026-08-23/24 在安全阀 0.92 下
+    batch=2 已稳定训练（97% util / 230W / 754–896s/epoch），捕获后仍有 >12%
+    空闲显存，从未溢出。
+    故此处把预留收到 0.10（vram_safe_ratio → 0.90）：既恢复 batch=2（88% ≤
+    90%，留 2% 余量），又不动基类默认值以免影响其他训练器的安全性。真正的
+    溢出兜底仍由 mixin 的 _GRAPH_SPILL_FREE_RATIO 捕获后检测负责。
     """
-    pass
+    GRAPH_POOL_VRAM_RESERVE_RATIO = 0.10
+
