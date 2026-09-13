@@ -1859,6 +1859,14 @@ class nnUNetTrainer(object):
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
 
+    def configure_validation_predictor(self, predictor):
+        """Hook：perform_actual_validation 创建 predictor 后调用（默认 no-op）。
+
+        子类/混入可覆盖以注入验证加速（例如把 network forward 捕获成 CUDA
+        Graph）。默认不改变任何行为。
+        """
+        return None
+
     def perform_actual_validation(self, save_probabilities: bool = False):
         if self.disable_checkpointing:
             self.print_to_log_file('Validation skipped, checkpointing is disabled')
@@ -1882,6 +1890,8 @@ class nnUNetTrainer(object):
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
                                         self.dataset_json, self.__class__.__name__,
                                         self.inference_allowed_mirroring_axes)
+        # 验证加速注入点（默认 no-op；CUDAGraphMixin 覆盖以武装 forward CUDA Graph）
+        self.configure_validation_predictor(predictor)
 
         with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
             worker_list = [i for i in segmentation_export_pool._pool]

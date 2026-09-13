@@ -35,6 +35,7 @@ batch's shapes to build static buffers (guarantees shapes match the dataloader
 exactly, including deep-supervision target lists). Subsequent steps replay.
 """
 import gc
+import os
 
 import torch
 from torch.amp import autocast
@@ -70,6 +71,15 @@ class nnUNetTrainerCUDAGraphMixin:
     # 每 epoch ~78s，比训练本身还慢），故默认走 val_batch_size 小 batch 方案。
     # 若需大验证 batch 且接受重捕获开销，子类可置 True 并设 val_batch_size=None。
     release_graph_for_validation = False
+    # 验证 forward 是否也捕获 CUDA Graph(默认开)。验证是 36 次/图
+    # (9 tile × 4 mirror TTA)的 launch-bound 前向，捕获收益远大于训练侧。
+    # 置 False 或设环境变量 NNUNET_VAL_NO_CUDAGRAPH=1 可回退 eager(A/B 基线)。
+    use_cuda_graph_for_validation = True
+    # 捕获后私有池外置检测阈值：若整卡空闲显存占比低于该值，判定 graph 私有池
+    # 已被 WDDM 驱动静默溢出到共享内存（replay 走 PCIe，慢约 8x），弃用 graph。
+    # 配合 BatchProbeCUDAGraph 的 0.80 探测安全阀，正常情况下捕获后仍有 >5%
+    # 空闲，不会误判；仅当整卡被压满（异常）时触发。
+    _GRAPH_SPILL_FREE_RATIO = 0.02
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -137,9 +147,16 @@ class nnUNetTrainerCUDAGraphMixin:
         # --- Lazy capture on first step (single GPU only) ---
         if (self.use_cuda_graphs and self.device.type == 'cuda' and not self.is_ddp
                 and not self._capture_attempted):
-            self._capture_attempted = True
+            self._capture_attempted = True   # 只尝试一次，避免每步重捕获
             try:
-                self._capture_cuda_graph(data, target)
+                captured = self._capture_cuda_graph(data, target)
+            except Exception as e:
+                # OOM or unsupported op: drop graph, keep training eager
+                captured = False
+                self.print_to_log_file(
+                    f"CUDA Graphs: capture FAILED ({type(e).__name__}: {e}). "
+                    "Falling back to eager training.")
+            if captured:
                 # capture 自身已完成一次完整的 step（_graph_optimizer_step），
                 # 等同于一个累积边界 → 计数器归零，避免后续 replay 的累积相位错位。
                 self._accum_step_counter = 0
@@ -147,13 +164,10 @@ class nnUNetTrainerCUDAGraphMixin:
                 # capture 已用真实数据完成一次完整训练步（forward+backward+step），
                 # 直接返回该 loss，不再重复 replay 同一 batch
                 return {'loss': self.static_loss.detach().cpu().numpy()}
-            except Exception as e:
-                # OOM or unsupported op: drop graph, keep training eager
-                self.cuda_graph = None
-                self.static_input = self.static_target = self.static_loss = None
-                self.print_to_log_file(
-                    f"CUDA Graphs: capture FAILED ({type(e).__name__}: {e}). "
-                    "Falling back to eager training.")
+            # 捕获失败 / 私有池被驱动外置 → 丢弃 graph 走 eager（外置的 replay
+            # 要走 PCIe，实测慢 ~8x，远不如 eager）。
+            self.cuda_graph = None
+            self.static_input = self.static_target = self.static_loss = None
 
         # --- Eager path (first step, DDP, CPU, or capture failed) ---
         return super().train_step({'data': data, 'target': target})
@@ -213,6 +227,17 @@ class nnUNetTrainerCUDAGraphMixin:
                 f"num_val_iterations_per_epoch={self.num_val_iterations_per_epoch}")
         return super().get_dataloaders()
 
+    def _cuda_free_ratio(self):
+        """当前设备空闲显存占比（0-1）；查询失败返回 None。
+
+        用于捕获后判定 graph 私有池是否被 WDDM 驱动外置到共享内存。
+        """
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(self.device)
+            return (free_b / total_b) if total_b else None
+        except Exception:
+            return None
+
     def _copy_into_static(self, data: torch.Tensor, target):
         """Copy real batch into static buffers (non_blocking, no sync)."""
         self.static_input.copy_(data)
@@ -262,12 +287,18 @@ class nnUNetTrainerCUDAGraphMixin:
         consumes the real gradient - equivalent to one normal training step.
         """
         if self.device.type != 'cuda' or self.is_ddp:
-            return  # graph disabled on CPU / DDP
+            return False  # graph disabled on CPU / DDP
 
         self.print_to_log_file(
             "CUDA Graphs: capturing training step "
             f"(batch={data.shape[0]}, patch={tuple(data.shape[2:])}, "
             f"AMP={self.autocast_dtype}) ...")
+
+        # 0. 捕获前回收 allocator 缓存/碎片并同步，尽量给 graph 私有池留连续显存
+        #    （探针可能留下大块缓存；见 BatchProbe._reclaim_vram_after_probe）。
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(self.device)
 
         # 1. Static buffers with shapes taken from the real batch (exact match
         #    with the dataloader, including deep-supervision target list).
@@ -307,10 +338,32 @@ class nnUNetTrainerCUDAGraphMixin:
         with torch.cuda.graph(self.cuda_graph):
             self._graph_forward_backward()
 
-        # 4. Consume the gradient produced inside the capture (outside graph)
+        # 4. 私有池外置检测：WDDM 显存超订时驱动不报 OOM，而是把 graph 私有池
+        #    静默溢出到共享内存，此后每次 replay 的激活都走 PCIe（实测慢 ~8x、
+        #    功耗腰斩）。捕获后若整卡几乎无空闲显存，判为外置 → 弃用 graph 走
+        #    eager（捕获产生的梯度丢弃，由下一次 eager train_step 重算）。
+        free_ratio = self._cuda_free_ratio()
+        if free_ratio is not None and free_ratio < self._GRAPH_SPILL_FREE_RATIO:
+            self.print_to_log_file(
+                f"CUDA Graphs: capture completed but free VRAM only "
+                f"{free_ratio:.1%} (< {self._GRAPH_SPILL_FREE_RATIO:.0%}) — "
+                "graph 私有池可能已被驱动外置到共享内存（replay 走 PCIe）。"
+                "弃用 CUDA Graph，回退 eager 训练。")
+            self.cuda_graph = None
+            self.static_input = None
+            self.static_target = None
+            self.static_loss = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            # 丢弃捕获期间产生的梯度，避免回退 eager 时与 eager backward 叠加
+            self.optimizer.zero_grad(set_to_none=True)
+            return False
+
+        # 5. Consume the gradient produced inside the capture (outside graph)
         self._graph_optimizer_step()
 
         self.print_to_log_file("CUDA Graphs: capture complete, replay mode on.")
+        return True
 
     # ------------------------------------------------------------------ #
     #  Validation: release graph to free VRAM, re-capture on next train   #
@@ -350,3 +403,36 @@ class nnUNetTrainerCUDAGraphMixin:
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize(self.device)
+
+    # ------------------------------------------------------------------ #
+    #  Validation forward CUDA Graph                                       #
+    # ------------------------------------------------------------------ #
+    def configure_validation_predictor(self, predictor):
+        """把验证推理的 network forward 也捕获成 CUDA Graph（默认开）。
+
+        perform_actual_validation 每张图要做 9 tile × 4 mirror TTA = 36 次前向，
+        且该前向是 CPU launch-bound（实测耗时与 batch 无关），因此图的收益比
+        训练侧更大。捕获与三重自检都委托给 predictor 侧的 CudaGraphForward
+        （捕获失败 / 数值不符 / 无速度收益 → 自动永久回退 eager）。
+
+        回退开关：use_cuda_graph_for_validation=False 或环境变量
+        NNUNET_VAL_NO_CUDAGRAPH=1。DDP / CPU 下不启用（与训练侧一致）。
+        """
+        super().configure_validation_predictor(predictor)
+        if not (getattr(self, 'use_cuda_graphs', True)
+                and getattr(self, 'use_cuda_graph_for_validation', True)):
+            return
+        if os.environ.get('NNUNET_VAL_NO_CUDAGRAPH', '').lower() in (
+                '1', 'true', 't', 'yes', 'on'):
+            self.print_to_log_file(
+                "[CUDAGraph] NNUNET_VAL_NO_CUDAGRAPH set — 验证 forward 保持 eager")
+            return
+        if self.is_ddp or self.device.type != 'cuda':
+            return
+        armed = predictor.enable_cuda_graph_forward(
+            autocast_dtype=self.autocast_dtype,
+            spill_free_ratio=self._GRAPH_SPILL_FREE_RATIO,
+            logger=self.print_to_log_file)
+        self.print_to_log_file(
+            f"[CUDAGraph] 验证 forward CUDA Graph: "
+            f"{'已武装（首次前向惰性捕获）' if armed else '不可用，走 eager'}")
