@@ -11,6 +11,8 @@ from nnunetv2.utilities.network_initialization import InitWeights_He
 from nnunetv2.nets.LightSS2DMambaUNet import LightSS2DMambaUNet
 import torch
 from torch import nn
+from torch.optim import Adam
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 
 
 class nnUNetTrainerLightSS2DMambaUNet(nnUNetTrainer_MedNeXtBase):
@@ -22,7 +24,26 @@ class nnUNetTrainerLightSS2DMambaUNet(nnUNetTrainer_MedNeXtBase):
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, device)
+        # 必须关键字传 device：MRO 下一跳 nnUNetTrainer_MedNeXtBase.__init__ 的签名是
+        # (plans, configuration, fold, dataset_json, unpack_dataset=True, device=...)，
+        # 位置传参会把 device 错位塞进 unpack_dataset，device 落回默认（无 index）→
+        # DDP 下兜底成 cuda:local_rank 而绑错卡（同 2026-08-11 事故）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # nnUZoo 原版超参（对应 nnUZoo nnUNetTrainerLightSS2DMambaUNet.__init__）
+        self.initial_lr = 1e-4
+        self.weight_decay = 1e-5
+
+    def configure_optimizers(self):
+        """按 nnUZoo 原版恢复 Adam + PolyLRScheduler（勿再当冗余方法删除）。
+
+        基类默认 SGD(lr=1e-2, wd=3e-5)，与原版 Adam(lr=1e-4, wd=1e-5)
+        + PolyLRScheduler(exponent=0.9) 不等价。
+        """
+        optimizer = Adam(self.network.parameters(), lr=self.initial_lr,
+                         weight_decay=self.weight_decay, eps=1e-5)
+        scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs,
+                                    exponent=0.9)
+        return optimizer, scheduler
 
     def _do_i_compile(self) -> bool:
         """

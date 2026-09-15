@@ -10,6 +10,8 @@ from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager
 from nnunetv2.nets.swt import SwinTransformerUnet
 import torch
 from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn import LayerNorm
 
 
@@ -23,7 +25,34 @@ class nnUNetTrainerSwinTransformerUnet(nnUNetTrainer_MedNeXtBase):
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, device)
+        # 必须关键字传 device：MRO 下一跳 nnUNetTrainer_MedNeXtBase.__init__ 的签名是
+        # (plans, configuration, fold, dataset_json, unpack_dataset=True, device=...)，
+        # 位置传参会把 device 错位塞进 unpack_dataset，device 落回默认（无 index）→
+        # DDP 下兜底成 cuda:local_rank 而绑错卡（同 2026-08-11 事故）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # nnUZoo 原版超参（对应 nnUZoo nnUNetTrainerSwinTransformerUnet.__init__）
+        self.initial_lr = 1e-4
+        self.weight_decay = 5e-2
+
+    def configure_optimizers(self):
+        """按 nnUZoo 原版恢复 AdamW + CosineAnnealingLR（勿再当冗余方法删除）。
+
+        基类 nnUNetTrainer 提供的是 nnUNet 官方
+        SGD(lr=1e-2, momentum=0.99, nesterov=True, wd=3e-5) + PolyLRScheduler，
+        与原版 AdamW(lr=1e-4, wd=5e-2) + CosineAnnealingLR 训练协议不等价
+        （学习率相差 100 倍），误删会使训练发散至 NaN（2026-09-15 SSND2Net 实证）。
+        """
+        optimizer = AdamW(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            eps=1e-5,
+            betas=(0.9, 0.999),
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs, eta_min=1e-6)
+        self.print_to_log_file(f"Using optimizer {optimizer}")
+        self.print_to_log_file(f"Using scheduler {scheduler}")
+        return optimizer, scheduler
 
     def set_deep_supervision_enabled(self, enabled: bool):
         """

@@ -11,6 +11,8 @@ from nnunetv2.utilities.network_initialization import InitWeights_He
 from nnunetv2.nets.u2net_multi import U2NET
 import torch
 from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 class nnUNetTrainerU2NetMulti(nnUNetTrainer_MedNeXtBase):
@@ -34,8 +36,31 @@ class nnUNetTrainerU2NetMulti(nnUNetTrainer_MedNeXtBase):
         # unpack_dataset，使 device 落回无 index 的默认值（指定卡 / DDP 时绑错卡。
         # 同一修复见 nnUNetTrainerBatchProbe.__init__）。
         super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # nnUZoo 原版超参（对应 nnUZoo nnUNetTrainerU2NetMulti.__init__）
+        self.initial_lr = 1e-4
+        self.weight_decay = 5e-2
         # 显式写入（= 基类默认 50），保证不被 MRO 链上的其它类改写，口径与其它训练器一致。
         self.num_val_iterations_per_epoch = self.NUM_VAL_ITERATIONS_PER_EPOCH
+
+    def configure_optimizers(self):
+        """按 nnUZoo 原版恢复 AdamW + CosineAnnealingLR（勿再当冗余方法删除）。
+
+        基类 nnUNetTrainer 提供的是 nnUNet 官方
+        SGD(lr=1e-2, momentum=0.99, nesterov=True, wd=3e-5) + PolyLRScheduler，
+        与原版 AdamW(lr=1e-4, wd=5e-2) + CosineAnnealingLR 训练协议不等价
+        （学习率相差 100 倍），误删会使训练发散至 NaN（2026-09-15 SSND2Net 实证）。
+        """
+        optimizer = AdamW(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            eps=1e-5,
+            betas=(0.9, 0.999),
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs, eta_min=1e-6)
+        self.print_to_log_file(f"Using optimizer {optimizer}")
+        self.print_to_log_file(f"Using scheduler {scheduler}")
+        return optimizer, scheduler
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:

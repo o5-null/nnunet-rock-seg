@@ -132,16 +132,18 @@ class nnUNetTrainerCUDAGraphMixin:
             # backward 的梯度不可见，GradScaler.step 报 "No inf checks were
             # recorded"。就地置零(zero_())保持地址稳定。
             #
-            # 梯度累积（accum>1）: 非边界步**跳过** zero_grad → 保留已累积
-            # 梯度；replay 的 backward 在已有 grad 上**累加**（autograd 语义，
-            # 写入同一地址）。边界步才 zero_grad + step。这样 graph 捕获的
-            # forward+loss+backward 被复用 N 次，kernel launch 开销再除以 N。
-            if is_boundary:
-                self.optimizer.zero_grad(set_to_none=False)
+            # 梯度累积（accum>1，与 BatchProbe.train_step / eager 版同语义）:
+            # 非边界步只 replay（backward 在已有 grad 上**累加**，autograd 语义，
+            # 写入同一地址）；边界步 replay 完成第 N 次累积后 step，再 zero_grad
+            # 开启下一周期。顺序必须是 replay → step → zero（eager 版亦为 step
+            # 后清零）；若在 replay 前清零会丢弃前 N-1 步已累积的梯度，每 step
+            # 只剩 1 个 micro-batch 起作用（2026-09-15 实测 grad-norm 0.30 vs
+            # 正确 0.92）。
             self._copy_into_static(data, target)
             self.cuda_graph.replay()
             if is_boundary:
                 self._graph_optimizer_step()
+                self.optimizer.zero_grad(set_to_none=False)
             return {'loss': self.static_loss.detach().cpu().numpy()}
 
         # --- Lazy capture on first step (single GPU only) ---
@@ -327,14 +329,26 @@ class nnUNetTrainerCUDAGraphMixin:
         # stream（capture 在主 stream 时触发 stream mismatch 警告，可能破坏
         # capture）。置 None + 同步后 autograd 图可被回收。
         self.static_loss = None
-        self.optimizer.zero_grad(set_to_none=True)
+        # ⚠️ 必须 set_to_none=False：让 p.grad 保持为「已存在的零张量」。
+        #
+        # AccumulateGrad 对 leaf 的 grad 有 Python 级分支：
+        #     grad is None  → 赋值（拷贝）
+        #     grad 非 None  → 就地 +=
+        # 该分支在 capture 时被固化进图。若 capture 前用 set_to_none=True，
+        # grad 变 None → 图中记录的是「赋值」→ replay 每次都**覆盖**而非累加，
+        # 「replay 复用 N 次累积梯度」的设计前提彻底失效（accum>1 时每步实际
+        # 只用到最后 1 个 micro-batch，有效 batch 退化为 actual_batch）。
+        # 2026-09-15 最小探针实证（leaf 单次 backward 贡献 2.0）：
+        #     capture 时 grad=None     → replay1=2.0, replay2=2.0  （覆盖）
+        #     capture 时 grad=零张量   → replay1=2.0, replay2=4.0  （累加）
+        # warmup 最后一轮 backward 已物化 grads，此处就地清零即可保留张量。
+        self.optimizer.zero_grad(set_to_none=False)
         torch.cuda.synchronize()
 
         # 3. Capture: forward + loss + backward inside the graph
         #    cache_enabled=False -> casts are explicit in-graph kernels, so
         #    replay always casts from the CURRENT weights (no stale fp16 cache)
         self.cuda_graph = torch.cuda.CUDAGraph()
-        self.optimizer.zero_grad(set_to_none=True)
         with torch.cuda.graph(self.cuda_graph):
             self._graph_forward_backward()
 
@@ -359,8 +373,12 @@ class nnUNetTrainerCUDAGraphMixin:
             self.optimizer.zero_grad(set_to_none=True)
             return False
 
-        # 5. Consume the gradient produced inside the capture (outside graph)
+        # 5. Consume the gradient produced inside the capture (outside graph),
+        #    then zero (set_to_none=False 保持图锁定的 grad 地址稳定），让随后
+        #    的 replay 周期从干净的累加器开始；否则 capture 残留会被计入第一
+        #    个累积周期（多算一步）。
         self._graph_optimizer_step()
+        self.optimizer.zero_grad(set_to_none=False)
 
         self.print_to_log_file("CUDA Graphs: capture complete, replay mode on.")
         return True

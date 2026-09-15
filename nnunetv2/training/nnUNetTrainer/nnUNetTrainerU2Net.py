@@ -12,6 +12,8 @@ U2Net forward 将所有侧输出上采样到全分辨率，因此所有 7 个输
 from typing import Union, List, Tuple
 import torch
 from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from nnunetv2.nets.u2net import U2NET
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
@@ -28,8 +30,31 @@ class nnUNetTrainerU2Net(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # nnUZoo 原版超参（对应 nnUZoo nnUNetTrainerU2Net.__init__）
+        self.initial_lr = 1e-4
+        self.weight_decay = 5e-2
         # nnUZoo 中显式开启 deep supervision（确保覆盖任何类变量覆盖）
         self.enable_deep_supervision = True
+
+    def configure_optimizers(self):
+        """按 nnUZoo 原版恢复 AdamW + CosineAnnealingLR（勿再当冗余方法删除）。
+
+        基类 nnUNetTrainer 提供的是 nnUNet 官方
+        SGD(lr=1e-2, momentum=0.99, nesterov=True, wd=3e-5) + PolyLRScheduler，
+        与原版 AdamW(lr=1e-4, wd=5e-2) + CosineAnnealingLR 训练协议不等价
+        （学习率相差 100 倍），误删会使训练发散至 NaN（2026-09-15 SSND2Net 实证）。
+        """
+        optimizer = AdamW(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            eps=1e-5,
+            betas=(0.9, 0.999),
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs, eta_min=1e-6)
+        self.print_to_log_file(f"Using optimizer {optimizer}")
+        self.print_to_log_file(f"Using scheduler {scheduler}")
+        return optimizer, scheduler
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:

@@ -8,7 +8,12 @@ v2 迁移说明:
   - 使用 build_network_architecture 标准 v2 签名
     (plans_manager, configuration_manager, num_input_channels, num_output_channels, ...)
   - 直接使用 num_output_channels 取代 dataset_json → get_label_manager 调用链
-  - 移除 nnUZoo 原版中基类已覆盖的 configure_optimizers / on_epoch_end 等冗余方法
+  - 移除 nnUZoo 原版中基类已覆盖的 on_epoch_end 等冗余方法
+  - ⚠️ configure_optimizers 不属于"冗余方法"，不可移除：nnUZoo 原版是
+    AdamW(lr=1e-4, wd=5e-2) + CosineAnnealingLR，而 nnUNet 基类提供的是
+    SGD(lr=1e-2, wd=3e-5) + PolyLRScheduler，两者不等价（lr 差 100 倍）。
+    早期误删导致 SSND2Net 以 SGD lr=1e-2 训练 → loss 逐 epoch 攀升 → NaN
+    （2026-09-15 定位根因）。现按 nnUZoo 原版恢复。
 """
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer_MedNeXtBase import nnUNetTrainer_MedNeXtBase
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
@@ -17,6 +22,8 @@ from nnunetv2.utilities.network_initialization import InitWeights_He
 from nnunetv2.nets.ssnd2net import SSND2Net
 import torch
 from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 class nnUNetTrainerSSND2Net(nnUNetTrainer_MedNeXtBase):
@@ -27,7 +34,36 @@ class nnUNetTrainerSSND2Net(nnUNetTrainer_MedNeXtBase):
     """
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, device)
+        # 必须关键字传 device：MRO 下一跳 nnUNetTrainer_MedNeXtBase.__init__ 的签名是
+        # (plans, configuration, fold, dataset_json, unpack_dataset=True, device=...)，
+        # 位置传参会把 device 错位塞进 unpack_dataset，device 落回默认（无 index）→
+        # DDP 下兜底成 cuda:local_rank 而绑错卡（同 2026-08-11 SegResNet/MedNeXtBase 事故）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # nnUZoo 原版超参（对应 nnUZoo nnUNetTrainerSSND2Net.__init__）：
+        # initial_lr=1e-4 / weight_decay=5e-2，配合下面的 AdamW + CosineAnnealingLR。
+        self.initial_lr = 1e-4
+        self.weight_decay = 5e-2
+
+    def configure_optimizers(self):
+        """按 nnUZoo 原版恢复 AdamW + CosineAnnealingLR（勿再当"冗余方法"删除）。
+
+        基类 nnUNetTrainer 提供的是 nnUNet 官方默认 SGD(lr=1e-2, momentum=0.99,
+        nesterov=True, wd=3e-5) + PolyLRScheduler，与本模型（SS2D/selective-scan
+        混合，407 LayerNorm + 471 InstanceNorm2d）原版训练协议不同：原版以
+        AdamW 的自适应步长配 lr=1e-4，而 SGD 用 1e-2 是 100 倍步长，训练在数个
+        epoch 内发散至 NaN（2026-09-15 实测 loss 2.08→9.91→nan）。
+        """
+        optimizer = AdamW(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            eps=1e-5,
+            betas=(0.9, 0.999),
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs, eta_min=1e-6)
+        self.print_to_log_file(f"Using optimizer {optimizer}")
+        self.print_to_log_file(f"Using scheduler {scheduler}")
+        return optimizer, scheduler
 
     def _get_deep_supervision_scales(self):
         """
