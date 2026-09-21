@@ -370,6 +370,44 @@ def run_training(dataset_name_or_id: Union[str, int],
             exit_on_interrupt("训练被用户中断 (Ctrl+C)，后台数据加载器已关闭，进程已干净退出。")
 
 
+def _parse_device_arg(device_str: str) -> torch.device:
+    """解析 -device 字符串: cpu / mps / cuda / cuda:N（N 为物理 GPU 索引）。
+
+    2026-09-21 由 run_training_entry() 内部闭包提取为模块级函数，
+    供推理入口（run_cross_dataset_predict）复用同一套解析规则，避免两处逻辑漂移。
+    """
+    if device_str == 'cpu':
+        return torch.device('cpu')
+    if device_str == 'mps':
+        return torch.device('mps')
+    if device_str == 'cuda':
+        return torch.device('cuda')
+    if device_str.startswith('cuda:'):
+        try:
+            idx = int(device_str.split(':', 1)[1])
+            return torch.device('cuda', idx)
+        except ValueError as e:
+            raise ValueError(f'Invalid -device value: {device_str!r}. Expected cuda:N with N an integer.') from e
+    raise ValueError(f'-device must be one of cpu / cuda / cuda:N / mps. Got: {device_str!r}')
+
+
+def _parse_gpu_list(gpu_str: str) -> List[int]:
+    """解析 -gpu 参数: 逗号分隔的物理 GPU 索引列表, 如 '0,5,6,7' -> [0,5,6,7]。
+
+    2026-09-21 由 run_training_entry() 内部闭包提取为模块级函数（原因同上）。
+    """
+    parts = [p.strip() for p in gpu_str.split(',') if p.strip()]
+    if not parts:
+        raise ValueError(f'Invalid -gpu value: {gpu_str!r}. Expected comma-separated GPU indices.')
+    try:
+        indices = [int(p) for p in parts]
+    except ValueError as e:
+        raise ValueError(f'Invalid -gpu value: {gpu_str!r}. Expected comma-separated integer GPU indices.') from e
+    if len(set(indices)) != len(indices):
+        raise ValueError(f'Duplicate GPU index in -gpu {gpu_str!r}.')
+    return indices
+
+
 def run_training_entry():
     import argparse
     parser = argparse.ArgumentParser()
@@ -431,35 +469,7 @@ def run_training_entry():
     args = parser.parse_args()
 
     # --- 解析 -device 与 -gpu，支持直接按物理索引选卡（无需 CUDA_VISIBLE_DEVICES 重映射） ---
-    def _parse_device_arg(device_str: str) -> torch.device:
-        """解析 -device 字符串: cpu / mps / cuda / cuda:N（N 为物理 GPU 索引）。"""
-        if device_str == 'cpu':
-            return torch.device('cpu')
-        if device_str == 'mps':
-            return torch.device('mps')
-        if device_str == 'cuda':
-            return torch.device('cuda')
-        if device_str.startswith('cuda:'):
-            try:
-                idx = int(device_str.split(':', 1)[1])
-                return torch.device('cuda', idx)
-            except ValueError as e:
-                raise ValueError(f'Invalid -device value: {device_str!r}. Expected cuda:N with N an integer.') from e
-        raise ValueError(f'-device must be one of cpu / cuda / cuda:N / mps. Got: {device_str!r}')
-
-    def _parse_gpu_list(gpu_str: str) -> List[int]:
-        """解析 -gpu 参数: 逗号分隔的物理 GPU 索引列表, 如 '0,5,6,7' -> [0,5,6,7]。"""
-        parts = [p.strip() for p in gpu_str.split(',') if p.strip()]
-        if not parts:
-            raise ValueError(f'Invalid -gpu value: {gpu_str!r}. Expected comma-separated GPU indices.')
-        try:
-            indices = [int(p) for p in parts]
-        except ValueError as e:
-            raise ValueError(f'Invalid -gpu value: {gpu_str!r}. Expected comma-separated integer GPU indices.') from e
-        if len(set(indices)) != len(indices):
-            raise ValueError(f'Duplicate GPU index in -gpu {gpu_str!r}.')
-        return indices
-
+    # 解析函数已提取为模块级 _parse_device_arg / _parse_gpu_list（见文件上方），推理入口复用同一套逻辑
     device = _parse_device_arg(args.device)
     gpu_list = _parse_gpu_list(args.gpu) if args.gpu is not None else None
 

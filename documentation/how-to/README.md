@@ -18,6 +18,7 @@ This section groups the existing documentation by task.
 - [Train models](train-models.md)
 - [Find the best configuration](find-best-configuration.md)
 - [Run inference](run-inference.md)
+- [Cross-dataset inference（跨数据集推理）](cross-dataset-inference.md)
 
 ## Training options and related topics
 

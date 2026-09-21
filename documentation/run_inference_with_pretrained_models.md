@@ -10,3 +10,12 @@ just continue using that!
 
 Not yet available for V2 :-(
 If you wish to run inference with pretrained models, check out the old nnU-Net for now. We are working on this full steam!
+
+## Cross-dataset inference（跨数据集推理，本 fork 特有）
+
+本 fork 额外提供了一个入口：用 **A 数据集训练好的 checkpoint**，对 **B 数据集（目标数据集）的全量图像**
+跑滑窗推理并评估，全程零训练。与 `nnUNetv2_predict` 的差别在于它会读目标数据集的
+`dataset.json` / `splits_final.json`，自动挑选 case、定位模型目录（`-p` 可省略），并直接产出
+`summary.json`。
+
+- [Cross-dataset inference 使用说明](how-to/cross-dataset-inference.md)
