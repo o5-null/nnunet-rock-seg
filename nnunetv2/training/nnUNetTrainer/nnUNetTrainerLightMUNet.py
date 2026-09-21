@@ -30,8 +30,23 @@ class nnUNetTrainerLightMUNet(nnUNetTrainer_MedNeXtBase):
             unpack_dataset: bool = True,
             device: torch.device = torch.device('cuda')
         ):
-        super().__init__(plans, configuration, fold, dataset_json, device)
-        self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        # 必须关键字传 device：MRO 下一跳 nnUNetTrainer_MedNeXtBase.__init__ 的签名是
+        # (plans, configuration, fold, dataset_json, unpack_dataset=True, device=...)，
+        # 位置传参会把 device 错位塞进 unpack_dataset，device 落回默认（无 index）→
+        # DDP 下兜底成 cuda:local_rank 而绑错卡（同 2026-08-11 事故）。
+        super().__init__(plans, configuration, fold, dataset_json, device=device)
+        # ========== 数值稳定性修复: fp16 → bf16 (2026-09-16) ==========
+        # 根因: fp16 只有 5 位指数（动态范围约 6e-5 .. 65504），本网络大量使用
+        # InstanceNorm（涉及统计量的倒数）与深监督多分辨率累加，数值范围易越界 →
+        # 溢出成 NaN。bf16 指数位与 fp32 相同（8 位），动态范围一致，从源头消除溢出
+        # （同 LightMamba2Net 2026-07-31 的修复思路）。
+        # 实证: LightMUNet 的 fp16 版 2026-09-14 跑满 100 epoch 但 Pseudo dice 恒 0.0000，
+        # 其 checkpoint_final 权重 335/335 张量全 NaN（权重彻底报废）；同网络族的
+        # LightMamba2Net 切 bf16 后跑满 100 epoch（nan=0, dice=0.6266）。
+        self.autocast_dtype = torch.bfloat16
+        # bf16 无需梯度缩放。显式禁用 GradScaler —— 它在 NaN 步只会静默跳过
+        # optimizer.step，让权重在「看似训练」中悄悄退化（LightMUNet 空转 88 epoch 的机制之一）。
+        self.grad_scaler = None
         self.initial_lr = 1e-4
         self.weight_decay = 1e-5
 
@@ -65,7 +80,9 @@ class nnUNetTrainerLightMUNet(nnUNetTrainer_MedNeXtBase):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        # 必须显式传 dtype=self.autocast_dtype：不传时 torch 默认 fp16，会让 __init__
+        # 里的 bf16 设置在本方法内完全失效（本类自带 train_step，不走基类那条已传 dtype 的路径）。
+        with autocast(self.device.type, dtype=self.autocast_dtype, enabled=True) if self.device.type == "cuda" else dummy_context():
             output = self.network(data)
             l = self.loss(output, target)
 

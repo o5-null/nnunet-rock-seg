@@ -75,6 +75,26 @@ from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 
 
+class NonFiniteLossError(RuntimeError):
+    """训练过程中出现非有限 loss（NaN/Inf）时抛出，用于立即中止训练。
+
+    为什么需要它
+    ------------
+    2026-09-14 LightMUNet 事故实证：train_step 的 loss 变 NaN 后，GradScaler 会
+    静默跳过 optimizer.step（它只对非有限梯度做出反应且不报错），而训练循环不
+    检查 loss，于是继续空转 88 个 epoch —— 权重冻结在半死状态、Pseudo dice 恒为
+    0.0000，最后照常写出 checkpoint_final.pth，被外部调度器 train_auto.py 误判为
+    「已完成」而永久跳过，污染整个实验矩阵。
+
+    为什么继承 RuntimeError 而不是 SystemExit
+    ----------------------------------------
+    SystemExit 不打印 traceback，且会被 run_training.py 入口的 KeyboardInterrupt
+    处理路径（exit_on_interrupt / os._exit）混淆语义；RuntimeError 会干净地穿过
+    nnUNetTrainer.run_training 的 try/finally，以及 run_training.py 中只捕获
+    KeyboardInterrupt 的 except，最终让进程以非零返回码 + traceback 退出 ——
+    这正是 train_auto.py 判定「训练失败」所需的信号。
+    """
+
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
@@ -195,6 +215,10 @@ class nnUNetTrainer(object):
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
+        # 真实验证 batch（由 get_dataloaders 解析并缓存）。验证 batch 可能与训练
+        # batch 不同（CUDAGraph 系会缩小 val batch 并反向放大验证迭代数），
+        # run_training 的验证进度条必须按此值计数，见 run_training 内注释。
+        self._val_batch_size_resolved = None
 
         ### initializing stuff for remembering things and such
         self._best_ema = None
@@ -762,8 +786,9 @@ class nnUNetTrainer(object):
             config['dataset'] = self._dataset_summary()
             config['training'] = {
                 'loss': self.loss.__class__.__name__ if self.loss is not None else None,
-                'optimizer': self.optimizer.__class__.__name__ if self.optimizer is not None else None,
-                'lr_scheduler': self.lr_scheduler.__class__.__name__ if self.lr_scheduler is not None else None,
+                # 优化器：类名 + 生效超参（详见 _optimizer_summary）。此前仅输出类名，
+                # 无法区分 SGD / Adam / AdamW 及各自步长策略，易掩盖静默偏差。
+                'optimizer': self._optimizer_summary(),
                 'initial_lr': getattr(self, 'initial_lr', None),
                 'autocast_dtype': str(getattr(self, 'autocast_dtype', 'n/a')),
             }
@@ -774,6 +799,34 @@ class nnUNetTrainer(object):
                                    f"Configuration name: {self.configuration_name}\n",
                                    config, '\n', add_timestamp=False)
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
+
+    def _optimizer_summary(self) -> dict:
+        """提取优化器类名与生效超参，随训练配置强制输出到日志。
+
+        动机：本项目大量自定义训练器各自 override configure_optimizers()，实际
+        生效的优化器（SGD / Adam / AdamW）分散在多层基类中。仅打印类名无法区分
+        「SGD 的 momentum 惯性」与「Adam/AdamW 的自适应步长」，更无法区分 Adam
+        （L2 耦合衰减）与 AdamW（解耦衰减）——后者是训练协议等价性评估的关键。
+        故统一展开 param_groups[0] 中真正生效的超参，任何训练器都被强制输出。
+
+        取 param_groups[0]：本项目所有训练器均为单一参数组，或各组超参一致；
+        不存在的键（如 SGD 无 betas）直接跳过，保持输出紧凑可读。
+        """
+        if self.optimizer is None:
+            return {'class': None}
+        opt = self.optimizer
+        summary = {'class': opt.__class__.__name__}
+        pg = opt.param_groups[0] if opt.param_groups else {}
+        for key in ('lr', 'weight_decay', 'momentum', 'nesterov',
+                    'dampening', 'betas', 'eps', 'amsgrad'):
+            if key not in pg:
+                continue
+            val = pg[key]
+            # betas 是 tuple，转字符串便于日志阅读与跨优化器比对
+            summary[key] = str(val) if isinstance(val, tuple) else val
+        if self.lr_scheduler is not None:
+            summary['lr_scheduler'] = self.lr_scheduler.__class__.__name__
+        return summary
 
     def _dataset_summary(self) -> dict:
         """提取当前训练数据集信息（名称 / 标签 / 样本数 / 通道 / 文件后缀）。
@@ -1176,7 +1229,14 @@ class nnUNetTrainer(object):
                                  oversample_foreground_percent=self.oversample_foreground_percent,
                                  sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
-        dl_val = nnUNetDataLoader(dataset_val, self.get_val_batch_size(),
+        # 验证 batch 可能小于训练 batch（CUDAGraph 系为规避 graph 私有池叠加溢出
+        # 而缩小 val batch，同时按比例放大 num_val_iterations_per_epoch 以保持验证
+        # 图总数不变）。在此一次性解析并缓存真实验证 batch，供 run_training 的
+        # 验证进度条计数——get_val_batch_size 在 CUDAGraphMixin 下带日志副作用，
+        # 不宜每 epoch 重复调用。降档重建 dataloader 时本方法会重跑并刷新缓存。
+        resolved_val_bs = self.get_val_batch_size()
+        self._val_batch_size_resolved = resolved_val_bs
+        dl_val = nnUNetDataLoader(dataset_val, resolved_val_bs,
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
@@ -1535,6 +1595,57 @@ class nnUNetTrainer(object):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
         return {'loss': l.detach().cpu().numpy()}
+
+    def _guard_finite_loss(self, loss_value, epoch: int, batch_id: int) -> None:
+        """loss 非有限（NaN/Inf）时先保存现场 checkpoint，再抛异常中止训练。
+
+        调用点只有一个：run_training 的训练循环里。之所以单点插入而不是给每个
+        train_step 逐一加守卫，是因为所有 train_step 变体（基类 / 各训练器覆写 /
+        CUDAGraphMixin 的 replay 与 capture 路径）最终都返回 {'loss': ...}，
+        单点即可全覆盖，也不会漏掉将来新增的训练器。
+
+        历史事故见 NonFiniteLossError 的 docstring（LightMUNet 空转 88 epoch）。
+
+        DDP 一致性（必须）
+        ------------------
+        若只有检出 NaN 的那个 rank 抛异常，其余 rank 会继续推进到下一次
+        collective（DDP 梯度 all-reduce / SyncBatchNorm 的 all-reduce）并永久等待，
+        直到 NCCL watchdog 超时（本项目设 10min）。因此先用 all_reduce(MAX) 把
+        「是否非有限」统一到所有 rank，再全体一致决策：要么全部继续，要么全部抛出。
+
+        关于保存的文件名
+        ----------------
+        故意用独立的 checkpoint_nan_abort.pth，不覆盖 checkpoint_latest.pth /
+        checkpoint_best.pth：后者是 train_auto.py 判断「是否续训」的依据，覆盖会
+        改变调度语义；独立文件只作事后取证用。
+        """
+        try:
+            finite = bool(np.all(np.isfinite(np.asarray(loss_value, dtype=np.float64))))
+        except (TypeError, ValueError):
+            # loss 结构异常（自定义 trainer 返回非数值）时不拦截，交回原逻辑
+            return
+
+        if self.is_ddp:
+            bad = torch.tensor([0.0 if finite else 1.0], device=self.device)
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+            finite = bad.item() == 0.0
+
+        if finite:
+            return
+
+        try:
+            abort_path = join(self.output_folder, 'checkpoint_nan_abort.pth')
+            self.save_checkpoint(abort_path)
+            self.print_to_log_file(
+                f"[NaN GUARD] 检测到非有限 loss={loss_value} "
+                f"(epoch={epoch}, iteration={batch_id})，现场已保存: {abort_path}")
+        except Exception as e:  # noqa: BLE001 — 保存失败也必须继续中止
+            self.print_to_log_file(
+                f"[NaN GUARD] 现场保存失败（不影响中止）: {type(e).__name__}: {e}")
+
+        raise NonFiniteLossError(
+            f"检测到非有限 loss（epoch={epoch}, iteration={batch_id}, "
+            f"loss={loss_value}）—— 立即中止训练，避免权重冻结后静默空转。")
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -2204,6 +2315,9 @@ class nnUNetTrainer(object):
                           unit="img", leave=False, disable=self.local_rank != 0) as pbar:
                     for batch_id in range(self.num_iterations_per_epoch):
                         output = self.train_step(next(self.dataloader_train))
+                        # NaN/Inf 守卫：非有限 loss → 保存现场后立即中止训练
+                        # （单点覆盖全部 train_step 变体；详见 _guard_finite_loss）
+                        self._guard_finite_loss(output['loss'], epoch, batch_id)
                         train_outputs.append(output)
                         # 每个 iteration 采样一次 GPU 状态（NVML 调用微秒级，开销可忽略）
                         self._accumulate_gpu_stats(self._sample_gpu_stats())
@@ -2217,13 +2331,22 @@ class nnUNetTrainer(object):
                 with torch.no_grad():
                     self.on_validation_epoch_start()
                     val_outputs = []
-                    total_val_imgs = self.num_val_iterations_per_epoch * effective_batch
+                    # 验证进度按真实验证 batch 计数：验证 batch 可能与训练 batch 不同
+                    # （CUDAGraph 系缩小 val batch 并反向放大 num_val_iterations_per_epoch
+                    # 以保持验证图总数恒定），沿用训练 effective_batch 会少算
+                    # val_batch/train_batch 倍，使进度条显示图数、s/img 与实际不符。
+                    # 该值由 get_dataloaders 解析缓存，降档重建时自动刷新。
+                    val_batch = self._val_batch_size_resolved
+                    if val_batch is None:
+                        val_batch = self.get_val_batch_size()
+                    val_effective_batch = val_batch * world_size
+                    total_val_imgs = self.num_val_iterations_per_epoch * val_effective_batch
                     with tqdm(total=total_val_imgs, desc=f"Epoch {epoch} Val",
                               unit="img", leave=False, disable=self.local_rank != 0) as pbar:
                         for batch_id in range(self.num_val_iterations_per_epoch):
                             output = self.validation_step(next(self.dataloader_val))
                             val_outputs.append(output)
-                            pbar.update(effective_batch)
+                            pbar.update(val_effective_batch)
                             pbar.set_postfix(loss=float(output['loss']))
                     self.on_validation_epoch_end(val_outputs)
 

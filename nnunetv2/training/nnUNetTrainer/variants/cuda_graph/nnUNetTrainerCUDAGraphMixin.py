@@ -80,6 +80,11 @@ class nnUNetTrainerCUDAGraphMixin:
     # 配合 BatchProbeCUDAGraph 的 0.80 探测安全阀，正常情况下捕获后仍有 >5%
     # 空闲，不会误判；仅当整卡被压满（异常）时触发。
     _GRAPH_SPILL_FREE_RATIO = 0.02
+    # 降 batch 重捕获的最大次数。每次降档都要重建 dataloader（augmenter worker
+    # 进程重启，约 1 分钟）并重新捕获（1-2 分钟），若不设上限，最坏情况会长时间
+    # 反复尝试。实测本项目显存超订幅度下，降 1-2 个 batch 即可显著缓解。
+    _MAX_BATCH_REDUCTIONS = 4
+
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -147,36 +152,175 @@ class nnUNetTrainerCUDAGraphMixin:
             return {'loss': self.static_loss.detach().cpu().numpy()}
 
         # --- Lazy capture on first step (single GPU only) ---
+        # 捕获失败/私有池外置时不再永久回退 eager，而是降 1 个 batch 后重捕获
+        # （eager 回退会让整个 run 失去 1.3-6x 的 graph 收益，详见该方法注释）。
         if (self.use_cuda_graphs and self.device.type == 'cuda' and not self.is_ddp
                 and not self._capture_attempted):
-            self._capture_attempted = True   # 只尝试一次，避免每步重捕获
-            try:
-                captured = self._capture_cuda_graph(data, target)
-            except Exception as e:
-                # OOM or unsupported op: drop graph, keep training eager
-                captured = False
-                self.print_to_log_file(
-                    f"CUDA Graphs: capture FAILED ({type(e).__name__}: {e}). "
-                    "Falling back to eager training.")
-            if captured:
-                # capture 自身已完成一次完整的 step（_graph_optimizer_step），
-                # 等同于一个累积边界 → 计数器归零，避免后续 replay 的累积相位错位。
-                self._accum_step_counter = 0
-                self._accum_boundary = True
-                # capture 已用真实数据完成一次完整训练步（forward+backward+step），
-                # 直接返回该 loss，不再重复 replay 同一 batch
-                return {'loss': self.static_loss.detach().cpu().numpy()}
-            # 捕获失败 / 私有池被驱动外置 → 丢弃 graph 走 eager（外置的 replay
-            # 要走 PCIe，实测慢 ~8x，远不如 eager）。
-            self.cuda_graph = None
-            self.static_input = self.static_target = self.static_loss = None
+            return self._attempt_capture_with_batch_fallback(data, target)
 
-        # --- Eager path (first step, DDP, CPU, or capture failed) ---
+        # --- Eager path (first step, DDP, CPU, 或 batch 已降至下限仍无法捕获) ---
         return super().train_step({'data': data, 'target': target})
 
     # ------------------------------------------------------------------ #
     #  Internals                                                          #
     # ------------------------------------------------------------------ #
+    def _attempt_capture_with_batch_fallback(self, data, target):
+        """捕获 CUDA Graph；VRAM 不足时逐次降 1 个 batch 重试，而非回退 eager。
+
+        历史行为：捕获失败或私有池被 WDDM 外置 → 永久回退 eager。但 graph 相对
+        eager 有 1.3-6x 收益（本项目实测 SwinTransformerUnet 11.4x、SwinUMamba
+        4.4x、U-Net 5.9x），一旦回退整个 run 都无法恢复。现改为降低训练 batch
+        （每次 -1，见 _reduce_batch_for_recapture）后重建 dataloader 并重捕获，
+        以牺牲少量 batch 换取保持 graph 加速。仅当 batch 已降到 1 仍失败（或降档
+        次数达 _MAX_BATCH_REDUCTIONS）才回退 eager 并明确告警。
+
+        返回：{'loss': ...}，与 train_step 契约一致。
+        """
+        while True:
+            self._capture_attempted = True   # 标记本次尝试；降档时会复位以便重试
+            try:
+                captured = self._capture_cuda_graph(data, target)
+            except Exception as e:
+                # OOM 或不受支持的算子：不立即回退，交给下面的降档逻辑
+                captured = False
+                self.print_to_log_file(
+                    f"CUDA Graphs: capture FAILED ({type(e).__name__}: {e}).")
+
+            if captured:
+                # capture 自身已完成一次完整 step（_graph_optimizer_step），等同于
+                # 一个累积边界 → 计数器归零，避免后续 replay 的累积相位错位。
+                self._accum_step_counter = 0
+                self._accum_boundary = True
+                # capture 已用真实数据完成一次完整训练步（forward+backward+step），
+                # 直接返回该 loss，不再重复 replay 同一 batch
+                return {'loss': self.static_loss.detach().cpu().numpy()}
+
+            # 捕获失败：彻底释放 graph 私有池与静态 buffer，再决定是否降档
+            self.cuda_graph = None
+            self.static_input = self.static_target = self.static_loss = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            if not self._reduce_batch_for_recapture():
+                self.print_to_log_file(
+                    "CUDA Graphs: 无法继续降 batch，回退 eager 训练。")
+                return super().train_step({'data': data, 'target': target})
+
+            # 用降档后的 dataloader 取真实 batch（捕获要求 shape 与 dataloader 一致）
+            batch = next(self.dataloader_train)
+            data = batch['data'].to(self.device, non_blocking=True)
+            if isinstance(batch['target'], list):
+                target = [t.to(self.device, non_blocking=True) for t in batch['target']]
+            else:
+                target = batch['target'].to(self.device, non_blocking=True)
+
+    def _reduce_batch_for_recapture(self) -> bool:
+        """训练 batch 减 1 并重建全部派生状态，供下一次图捕获使用。
+
+        返回 True 表示降档成功、可以重试捕获；False 表示不能继续降档。
+
+        为什么每一步都必须做（漏改任一项都会让训练循环静默错乱）
+        ------------------------------------------------------
+        (1) batch_size：nnUNetDataLoader 在**构造时**就固化了 batch_size（用于采样
+            数量与批次张量预分配），直接改训练器属性不会改变已存在 loader 的输出，
+            因此必须重建 dataloader。
+        (2) grad_accum_steps：CUDA Graph 内的 `loss / accum` 缩放是在捕获时**固化进
+            计算图**的（见 _graph_forward_backward），accum 与新 batch 不匹配会导致
+            梯度尺度错误；replay 的累积相位计数也依赖它。
+        (3) num_iterations_per_epoch：它是 run_training 的显式循环上界（不由 batch
+            推导），须按「每 epoch 样本数恒定」重算，否则每 epoch 数据量随 batch
+            缩小而减少。注意本 epoch 上界已固定，新值自下个 epoch 起生效。
+        (4) val 迭代数：get_dataloaders 会按 batch 比例放大验证迭代数以保持验证图数
+            恒定，该换算必须幂等（见 get_dataloaders 的基线记录），否则重建时会二次
+            放大。
+        """
+        if self.batch_size <= 1:
+            self.print_to_log_file(
+                "[CUDAGraph] batch 已为 1，无法继续降档。")
+            return False
+        done = getattr(self, '_batch_reduction_count', 0)
+        if done >= self._MAX_BATCH_REDUCTIONS:
+            self.print_to_log_file(
+                f"[CUDAGraph] 已降档 {done} 次（上限 "
+                f"{self._MAX_BATCH_REDUCTIONS}），停止降档。")
+            return False
+        self._batch_reduction_count = done + 1
+
+        old_bs = self.batch_size
+        self.batch_size = old_bs - 1
+        # BatchProbe 语义：actual_batch_size 才是驱动训练的实际值
+        self.actual_batch_size = self.batch_size
+
+        nominal = getattr(self, 'nominal_batch_size', None)
+        if nominal:
+            # 保持有效 batch ≈ nominal（与 BatchProbe 同款 ceil 公式）
+            self.grad_accum_steps = max(1, -(-nominal // self.batch_size))
+            iters_base = getattr(self, 'iterations_per_epoch_effective', None)
+            if iters_base:
+                effective_imgs = iters_base * nominal
+                self.num_iterations_per_epoch = max(
+                    1, -(-effective_imgs // self.batch_size))
+
+        # 关闭旧 dataloader（结束其 worker 进程/线程），再按新 batch 重建
+        for dl in (getattr(self, 'dataloader_train', None),
+                   getattr(self, 'dataloader_val', None)):
+            if dl is None:
+                continue
+            try:
+                dl._finish()
+            except Exception as e:  # noqa: BLE001 — 关闭失败不应阻断降档
+                self.print_to_log_file(
+                    f"[CUDAGraph] 关闭旧 dataloader 失败（继续降档）: "
+                    f"{type(e).__name__}: {e}")
+        self.dataloader_train, self.dataloader_val = self.get_dataloaders()
+
+        # 复位捕获/累积状态。_capture_attempted 不能靠 _release_cuda_graph 复位
+        # （它在 cuda_graph is None 时早退，而捕获失败时恰好是 None）。
+        self._capture_attempted = False
+        self._accum_step_counter = 0
+        self._accum_boundary = True
+        # 丢弃失败捕获残留的梯度，避免与新 batch 的梯度叠加
+        self.optimizer.zero_grad(set_to_none=True)
+
+        self.print_to_log_file(
+            f"[CUDAGraph] VRAM 不足，训练 batch {old_bs} → {self.batch_size}"
+            f"（第 {self._batch_reduction_count}/{self._MAX_BATCH_REDUCTIONS} 次），"
+            f"grad_accum_steps={getattr(self, 'grad_accum_steps', 1)}，"
+            f"num_iterations_per_epoch="
+            f"{getattr(self, 'num_iterations_per_epoch', '?')}，"
+            "重建 dataloader 后重试捕获。")
+        # 落盘：让降档结果对后续运行持续有效（见 _persist_batch_to_probe_cache）
+        self._persist_batch_to_probe_cache()
+        return True
+
+    def _persist_batch_to_probe_cache(self) -> None:
+        """把降档后的实际 batch 写回 probe 缓存，使其对后续运行持续生效。
+
+        为什么必须写回
+        --------------
+        probe 缓存的指纹只含 batch_nominal（plans 规定值，降档后不变），**不含**
+        actual_batch_size。若只改内存不落盘：进程重启后缓存照旧判定 HIT，读回
+        降档前的过大 batch → 训练中途又得重走一遍降档（每次降档需重建 dataloader
+        + 重捕获，约 3-5 分钟）。
+
+        只对实现了 probe 缓存的宿主（nnUNetTrainerBatchProbe 系）生效；
+        nnUNetTrainerLightMamba2NetCUDAGraph 这类纯 graph 组合没有缓存，直接跳过。
+
+        字段须与 _warmup_kernels 的 cache HIT 读取严格对齐；_save_probe_cache
+        自带异常捕获与日志，故此处不再重复 try/except。
+        """
+        save_fn = getattr(self, '_save_probe_cache', None)
+        if save_fn is None:
+            return
+        save_fn({
+            'actual_batch_size': self.batch_size,
+            'grad_accum_steps': getattr(self, 'grad_accum_steps', 1),
+            'num_iterations_per_epoch': getattr(
+                self, 'num_iterations_per_epoch', None),
+            # 标注来源，便于事后区分「探测所得」与「显存不足降档所得」
+            'probe_source': 'cudagraph_batch_reduction',
+        })
+
     def _do_i_compile(self):
         """CUDA Graphs 与 torch.compile 互斥：两者都消除 kernel launch 开销，
         叠加会冲突（compile 把网络包装成 OptimizedModule，破坏 graph capture 的
@@ -222,8 +366,15 @@ class nnUNetTrainerCUDAGraphMixin:
         """
         vb = self.get_val_batch_size()
         if vb != self.batch_size:
+            # 幂等：必须基于「原始基线」换算，而不是上一次的结果。降 batch 重捕获
+            # 会再次调用本方法重建 dataloader，按现值放大就会二次放大、验证迭代数
+            # 逐次膨胀。故首次调用时把基类原始值记为基线。
+            base = getattr(self, '_val_iterations_base', None)
+            if base is None:
+                base = self.num_val_iterations_per_epoch
+                self._val_iterations_base = base
             self.num_val_iterations_per_epoch = max(
-                1, -(-self.num_val_iterations_per_epoch * self.batch_size // vb))
+                1, -(-base * self.batch_size // vb))
             self.print_to_log_file(
                 f"[CUDAGraph] val_batch_size={vb} (train batch={self.batch_size}) — "
                 f"num_val_iterations_per_epoch={self.num_val_iterations_per_epoch}")
@@ -362,7 +513,7 @@ class nnUNetTrainerCUDAGraphMixin:
                 f"CUDA Graphs: capture completed but free VRAM only "
                 f"{free_ratio:.1%} (< {self._GRAPH_SPILL_FREE_RATIO:.0%}) — "
                 "graph 私有池可能已被驱动外置到共享内存（replay 走 PCIe）。"
-                "弃用 CUDA Graph，回退 eager 训练。")
+                "将降低 1 个训练 batch 后重试捕获（不再回退 eager）。")
             self.cuda_graph = None
             self.static_input = None
             self.static_target = None

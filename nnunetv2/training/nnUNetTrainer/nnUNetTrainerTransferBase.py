@@ -487,8 +487,10 @@ class TransferLearningBase:
             l = self.loss(output, target)
 
         if torch.isnan(l) or torch.isinf(l):
-            self.print_to_log_file(f"[WARNING] NaN/Inf loss at epoch {self.current_epoch}")
-            return {"loss": np.array([1.0])}
+            # 原实现返回假的 1.0 让 epoch 继续，等于掩盖 NaN（静默空转）；
+            # 改为复用基类守卫：保存现场 checkpoint 后抛 NonFiniteLossError。
+            # 守卫内部必定抛出，故无需 return。
+            self._guard_finite_loss(l.detach().cpu().numpy(), self.current_epoch, -1)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()

@@ -43,6 +43,16 @@ class nnUNetTrainerSSND2Net(nnUNetTrainer_MedNeXtBase):
         # initial_lr=1e-4 / weight_decay=5e-2，配合下面的 AdamW + CosineAnnealingLR。
         self.initial_lr = 1e-4
         self.weight_decay = 5e-2
+        # ========== 数值稳定性修复: fp16 → bf16 (2026-09-16) ==========
+        # 根因: fp16 只有 5 位指数（动态范围约 6e-5 .. 65504），SSM 选择性扫描的 exp/log 与深监督累加 的
+        # 数值范围易越界 → 溢出成 NaN。bf16 指数位与 fp32 相同（8 位），动态范围一致，
+        # 从源头消除溢出（同 LightMamba2Net 2026-07-31 的修复思路）。
+        # 实证: 同网络族的 LightMamba2Net fp16 版 nan=101 崩于 ep77，
+        # bf16 版跑满 100 epoch（nan=0, dice 0.6266）。
+        self.autocast_dtype = torch.bfloat16
+        # bf16 无需梯度缩放。显式禁用 GradScaler —— 它在 NaN 步只会静默跳过
+        # optimizer.step，让权重在「看似训练」中悄悄退化（LightMUNet 空转 88 epoch 的机制之一）。
+        self.grad_scaler = None
 
     def configure_optimizers(self):
         """按 nnUZoo 原版恢复 AdamW + CosineAnnealingLR（勿再当"冗余方法"删除）。

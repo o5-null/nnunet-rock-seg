@@ -6,6 +6,8 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer_MedNeXtBase import nnUNetTrai
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 from torch import nn
 from nnunetv2.nets.UMambaBot import get_umamba_bot_from_plans
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch
 import numpy as np
 
@@ -42,6 +44,32 @@ class nnUNetTrainerUMambaBot(nnUNetTrainer_MedNeXtBase):
             self.plans_manager.plans['configurations'][self.configuration_name]['patch_size'] = new_patch_size
             self.print_to_log_file(f"Patch size changed from {original_patch_size} to {new_patch_size} "
                                    f"to be divisible by total stride {total_stride}")
+
+        # 项目统一训练协议（对齐其余 nnUZoo 移植模型的 AdamW + Cosine）。
+        # 事实说明：U-Mamba 官方 nnUNetTrainerUMambaBot 并未覆盖 configure_optimizers，
+        # 走 nnU-Net 默认 SGD(lr=1e-2, momentum=0.99, nesterov) + PolyLR；且 nnUZoo
+        # 参考实现中不存在 UMambaBot/UMambaEnc。故此处**非"复原原版"**，而是为满足
+        # Dataset002 跨模型横向可比性（experiments_analysis/REPORT.md P2）统一协议。
+        self.initial_lr = 1e-4
+        self.weight_decay = 5e-2
+
+    def configure_optimizers(self):
+        """AdamW(lr=1e-4, wd=5e-2, eps=1e-5) + CosineAnnealingLR，对齐项目其余 Mamba 模型。
+
+        与 nnUNetTrainerSwinUMamba / SegMamba / LightMamba2Net 等保持同一协议，使
+        Dataset002 的横向对比不因优化器差异（SGD lr=1e-2 vs AdamW lr=1e-4，相差 100 倍）失真。
+        """
+        optimizer = AdamW(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            eps=1e-5,
+            betas=(0.9, 0.999),
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs, eta_min=1e-6)
+        self.print_to_log_file(f"Using optimizer {optimizer}")
+        self.print_to_log_file(f"Using scheduler {scheduler}")
+        return optimizer, scheduler
 
     @staticmethod
     def build_network_architecture(plans_manager: PlansManager,

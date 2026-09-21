@@ -122,3 +122,6 @@ AGENTS.md
 .codebase-memory/
 *_modified.py
 *_modified.md
+
+# 备份文件（编辑/重构脚本产生的 *.bak）
+*.bak
